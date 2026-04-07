@@ -1,0 +1,6 @@
+config.json
+sessions.json
+.env
+__pycache__/
+*.pyc
+*.log

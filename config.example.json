@@ -1,0 +1,17 @@
+{
+  "env_file": "~/.claude/channels/discord/.env",
+  "allowed_users": ["YOUR_DISCORD_USER_ID"],
+  "channels": {
+    "CHANNEL_ID_1": {
+      "name": "general",
+      "workdir": "/path/to/project",
+      "idle_timeout_min": 30
+    },
+    "CHANNEL_ID_2": {
+      "name": "archive",
+      "workdir": "/path/to/archive-project",
+      "idle_timeout_min": 30,
+      "timeout_seconds": 300
+    }
+  }
+}
