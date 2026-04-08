@@ -4,3 +4,4 @@ sessions.json
 __pycache__/
 *.pyc
 *.log
+*-report.*

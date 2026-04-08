@@ -1,16 +1,33 @@
 {
   "env_file": "~/.claude/channels/discord/.env",
   "allowed_users": ["YOUR_DISCORD_USER_ID"],
+  "cron_jobs": [
+    {
+      "name": "example-task",
+      "schedule": "0 9 * * *",
+      "channel_id": "CHANNEL_ID_1",
+      "prompt": "Execute your scheduled task here.",
+      "timeout_seconds": 300
+    },
+    {
+      "name": "example-reminder",
+      "schedule": "0 13 * * 1,3,5",
+      "channel_id": "CHANNEL_ID_1",
+      "direct_message": "⏰ Your reminder message here (sent directly, no Claude involved)"
+    }
+  ],
   "channels": {
     "CHANNEL_ID_1": {
-      "name": "general",
+      "name": "main",
+      "session_group": "main",
       "workdir": "/path/to/project",
-      "idle_timeout_min": 30
+      "idle_timeout_min": 60,
+      "timeout_seconds": 300
     },
     "CHANNEL_ID_2": {
       "name": "archive",
-      "workdir": "/path/to/archive-project",
-      "idle_timeout_min": 30,
+      "session_group": "main",
+      "purpose": "Archive channel description",
       "timeout_seconds": 300
     }
   }
