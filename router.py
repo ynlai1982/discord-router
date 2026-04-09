@@ -96,15 +96,6 @@ def get_session_group(cfg: Dict[str, Any]) -> str:
     return cfg.get("session_group", cfg.get("name", "default"))
 
 
-def _build_group_timeout_map() -> Dict[str, int]:
-    """Pre-compute max idle_timeout_min per session_group."""
-    groups: Dict[str, int] = {}
-    for _cid, cfg in channels_cfg.items():
-        group = get_session_group(cfg)
-        timeout = int(cfg.get("idle_timeout_min", 30))
-        groups[group] = max(groups.get(group, 0), timeout)
-    return groups
-
 
 def _resolve_group_workdir(group: str) -> str:
     """Return workdir for a session_group (first channel definition wins)."""
@@ -113,8 +104,6 @@ def _resolve_group_workdir(group: str) -> str:
             return cfg.get("workdir", str(Path.home()))
     return str(Path.home())
 
-
-_group_timeout_map: Dict[str, int] = _build_group_timeout_map()
 
 
 def get_group_lock(group: str) -> asyncio.Lock:
@@ -159,25 +148,33 @@ async def touch_session(group: str, session_id: Optional[str]) -> None:
         save_json(SESSIONS_PATH, _sessions)
 
 
-async def cleanup_idle_sessions() -> None:
+async def daily_session_reset() -> None:
+    """Reset sessions daily at 07:00 Taipei time. Groups with daily_reset=false are skipped."""
+    last_reset_date: Optional[str] = None
     while True:
-        await asyncio.sleep(60)
-        now = int(time.time())
-        changed = False
-        async with _sessions_lock:
-            stale = []
-            for group, row in _sessions.items():
-                timeout_min = _group_timeout_map.get(group, 30)
-                last_active = int(row.get("last_active", 0))
-                if last_active > 0 and (now - last_active) >= timeout_min * 60:
-                    stale.append(group)
-            for key in stale:
-                _sessions[key]["session_id"] = None
-                changed = True
-            if changed:
-                save_json(SESSIONS_PATH, _sessions)
-        if stale:
-            logger.info("Cleared idle sessions for groups: %s", stale)
+        await asyncio.sleep(30)
+        now = datetime.now(TZ_TAIPEI)
+        today = now.strftime("%Y-%m-%d")
+
+        if now.hour == 7 and now.minute == 0 and last_reset_date != today:
+            last_reset_date = today
+            # Collect groups that should NOT be reset
+            no_reset_groups: set = set()
+            for _cid, cfg in channels_cfg.items():
+                if not cfg.get("daily_reset", True):
+                    no_reset_groups.add(get_session_group(cfg))
+
+            async with _sessions_lock:
+                reset_groups = []
+                for group, row in _sessions.items():
+                    if group in no_reset_groups:
+                        continue
+                    if row.get("session_id"):
+                        row["session_id"] = None
+                        reset_groups.append(group)
+                if reset_groups:
+                    save_json(SESSIONS_PATH, _sessions)
+                    logger.info("Daily 07:00 reset — cleared sessions for groups: %s", reset_groups)
 
 
 # ---------------------------
@@ -229,9 +226,9 @@ async def run_claude(
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
-        logger.warning("Claude timed out after %ds — clearing session to avoid cascading failures", timeout_seconds)
-        # Return None session_id to force a fresh session next time
-        return "", None, f"Claude timeout after {timeout_seconds}s"
+        logger.warning("Claude timed out after %ds", timeout_seconds)
+        # Keep session_id so caller can retry with same session
+        return "", session_id, f"Claude timeout after {timeout_seconds}s"
 
     stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
@@ -400,6 +397,22 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                         model=model,
                         timeout_seconds=timeout_seconds,
                     )
+
+                    # Auto-retry once on timeout (same session)
+                    if err and "timeout" in err.lower():
+                        logger.info("Cron job %s: timeout, retrying with same session...", name)
+                        await discord_channel.send("⏳ 重試中...")
+                        result, new_session_id, err = await run_claude(
+                            prompt=prompt,
+                            session_id=session_id,
+                            workdir=workdir,
+                            model=model,
+                            timeout_seconds=timeout_seconds,
+                        )
+                        if err and "timeout" in err.lower():
+                            logger.warning("Cron job %s: retry also timed out, clearing session", name)
+                            new_session_id = None
+
                     await touch_session(group, new_session_id)
 
                     output_text = f"Error: {err}" if err else result
@@ -417,11 +430,11 @@ async def run_cron_jobs(client: "RouterClient") -> None:
 class RouterClient(discord.Client):
     def __init__(self, **kwargs: Any):
         super().__init__(**kwargs)
-        self.cleanup_task: Optional[asyncio.Task] = None
+        self.daily_reset_task: Optional[asyncio.Task] = None
         self.cron_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
-        self.cleanup_task = asyncio.create_task(cleanup_idle_sessions())
+        self.daily_reset_task = asyncio.create_task(daily_session_reset())
         self.cron_task = asyncio.create_task(run_cron_jobs(self))
 
     async def on_ready(self) -> None:
@@ -471,6 +484,21 @@ class RouterClient(discord.Client):
                     model=model,
                     timeout_seconds=timeout_seconds,
                 )
+
+                # Auto-retry once on timeout (same session)
+                if err and "timeout" in err.lower():
+                    logger.info("Timeout detected, retrying with same session...")
+                    await message.channel.send("⏳ 重試中...")
+                    result, new_session_id, err = await run_claude(
+                        prompt=prompt,
+                        session_id=session_id,
+                        workdir=workdir,
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    if err and "timeout" in err.lower():
+                        logger.warning("Retry also timed out, clearing session")
+                        new_session_id = None
 
                 await touch_session(group, new_session_id)
 
