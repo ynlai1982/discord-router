@@ -16,6 +16,8 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 SESSIONS_PATH = Path(__file__).parent / "sessions.json"
+MCP_CONFIG_PATH = Path(__file__).parent / "mcp" / "discord-mcp.json"
+MCP_SERVER_PATH = Path(__file__).parent / "mcp" / "server.ts"
 CHUNK_SIZE = 2000
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 9876
@@ -196,6 +198,8 @@ async def run_claude(
         "--print",
         "--output-format", "json",
         "--dangerously-skip-permissions",
+        "--mcp-config", str(MCP_CONFIG_PATH),
+        "--strict-mcp-config",
     ]
 
     if session_id:
@@ -552,6 +556,22 @@ class RouterClient(discord.Client):
             await message.channel.send(f"Error: workdir not found: {workdir}")
 
 
+def ensure_mcp_config() -> None:
+    """Generate mcp/discord-mcp.json with the current absolute path to the
+    fork. Regenerated on every router start so the file stays correct after
+    a clone, move, or rename — no machine-specific path is committed."""
+    cfg = {
+        "mcpServers": {
+            "discord": {
+                "command": "bun",
+                "args": ["run", str(MCP_SERVER_PATH)],
+            }
+        }
+    }
+    MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MCP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> None:
     # Load .env from config path or default
     env_file = config.get("env_file", "")
@@ -567,6 +587,8 @@ def main() -> None:
     router_token = os.getenv("DISCORD_ROUTER_TOKEN", "").strip()
     if not router_token:
         raise RuntimeError("Missing DISCORD_ROUTER_TOKEN")
+
+    ensure_mcp_config()
 
     intents = discord.Intents.default()
     intents.message_content = True

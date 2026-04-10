@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 *.log
 *-report.*
+mcp/node_modules/
+mcp/discord-mcp.json
+inbox/
