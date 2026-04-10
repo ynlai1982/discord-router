@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from dotenv import load_dotenv
+from http_api import serve_http_api
 
 # Asia/Taipei = UTC+8
 TZ_TAIPEI = timezone(timedelta(hours=8))
@@ -16,6 +17,9 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 CONFIG_PATH = Path(__file__).parent / "config.json"
 SESSIONS_PATH = Path(__file__).parent / "sessions.json"
 CHUNK_SIZE = 2000
+HTTP_HOST = "127.0.0.1"
+HTTP_PORT = 9876
+INBOX_DIR = str(Path(__file__).parent / "inbox")
 
 # ---------------------------
 # Logging
@@ -437,10 +441,23 @@ class RouterClient(discord.Client):
         super().__init__(**kwargs)
         self.daily_reset_task: Optional[asyncio.Task] = None
         self.cron_task: Optional[asyncio.Task] = None
+        self.http_api_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
         self.daily_reset_task = asyncio.create_task(daily_session_reset())
         self.cron_task = asyncio.create_task(run_cron_jobs(self))
+        self.http_api_task = asyncio.create_task(
+            serve_http_api(
+                client=self,
+                token=os.environ["DISCORD_ROUTER_TOKEN"],
+                get_channel_cfg=get_channel_cfg,
+                split_chunks=split_chunks,
+                inbox_dir=INBOX_DIR,
+                host=HTTP_HOST,
+                port=HTTP_PORT,
+                logger=logger,
+            )
+        )
 
     async def on_ready(self) -> None:
         logger.info("Discord router online: %s (%s)", self.user, self.user.id if self.user else "?")
@@ -547,6 +564,9 @@ def main() -> None:
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
         raise RuntimeError("Missing DISCORD_BOT_TOKEN")
+    router_token = os.getenv("DISCORD_ROUTER_TOKEN", "").strip()
+    if not router_token:
+        raise RuntimeError("Missing DISCORD_ROUTER_TOKEN")
 
     intents = discord.Intents.default()
     intents.message_content = True
