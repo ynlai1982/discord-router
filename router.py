@@ -269,11 +269,11 @@ async def run_claude(
 
     # BUG-1 fix: result=null → str(None)="None" is truthy, check explicitly
     if result is None:
-        result = "(empty)"
+        result = ""
     else:
-        result = str(result)
-    if not result:
-        result = "(empty)"
+        result = str(result).strip()
+    # Empty result likely means Claude replied via MCP tool (e.g. Discord reply),
+    # so we don't need to send anything from Router side.
 
     # BUG-2 fix: only use new_session_id if it's a non-empty string
     if new_session_id and isinstance(new_session_id, str) and new_session_id.strip():
@@ -415,9 +415,14 @@ async def run_cron_jobs(client: "RouterClient") -> None:
 
                     await touch_session(group, new_session_id)
 
-                    output_text = f"Error: {err}" if err else result
-                    for chunk in split_chunks(output_text):
-                        await discord_channel.send(chunk)
+                    if err:
+                        output_text = f"Error: {err}"
+                        for chunk in split_chunks(output_text):
+                            await discord_channel.send(chunk)
+                    elif result:
+                        for chunk in split_chunks(result):
+                            await discord_channel.send(chunk)
+                    # else: empty result = Claude replied via MCP, skip
 
                 logger.info("Cron job %s completed", name)
             except Exception:
@@ -456,8 +461,23 @@ class RouterClient(discord.Client):
             return
 
         user_text = (message.content or "").strip()
-        if not user_text:
+
+        # Build attachment info
+        attachment_lines = []
+        if message.attachments:
+            for att in message.attachments:
+                attachment_lines.append(
+                    f"[附件: {att.filename} | 類型: {att.content_type or 'unknown'} | "
+                    f"大小: {att.size} bytes | URL: {att.url}]"
+                )
+
+        if not user_text and not attachment_lines:
             return
+
+        # Append attachment info to user text
+        if attachment_lines:
+            att_block = "\n".join(attachment_lines)
+            user_text = f"{user_text}\n{att_block}" if user_text else att_block
 
         channel_id = str(message.channel.id)
         channel_name = cfg.get("name", channel_id)
@@ -502,9 +522,14 @@ class RouterClient(discord.Client):
 
                 await touch_session(group, new_session_id)
 
-                output_text = f"Error: {err}" if err else result
-                for chunk in split_chunks(output_text):
-                    await message.channel.send(chunk)
+                if err:
+                    output_text = f"Error: {err}"
+                    for chunk in split_chunks(output_text):
+                        await message.channel.send(chunk)
+                elif result:
+                    for chunk in split_chunks(result):
+                        await message.channel.send(chunk)
+                # else: empty result = Claude replied via MCP, skip
         except FileNotFoundError:
             logger.error("workdir not found: %s", workdir)
             await message.channel.send(f"Error: workdir not found: {workdir}")
