@@ -344,7 +344,8 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             channel_id = str(job.get("channel_id", ""))
             prompt_text = job.get("prompt", "")
 
-            if not schedule or not channel_id or not prompt_text:
+            direct_msg = job.get("direct_message")
+            if not schedule or not channel_id or (not prompt_text and not direct_msg):
                 continue
 
             if last_fired.get(name) == now_key:
@@ -357,7 +358,6 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             logger.info("Cron firing: %s -> channel %s", name, channel_id)
 
             # Direct message: send to Discord without running Claude
-            direct_msg = job.get("direct_message")
             if direct_msg:
                 try:
                     discord_channel = client.get_channel(int(channel_id))
