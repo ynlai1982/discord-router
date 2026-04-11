@@ -23,6 +23,13 @@ HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 9876
 INBOX_DIR = str(Path(__file__).parent / "inbox")
 
+# Idle watchdog defaults (overridable via config.json -> "idle_watchdog").
+# Catches stdio/stream stalls that wall-clock timeout takes too long to notice.
+IDLE_WATCHDOG_DEFAULT_ENABLED = True
+IDLE_WATCHDOG_DEFAULT_THRESHOLD = 180
+IDLE_WATCHDOG_DEFAULT_POLL = 5.0
+CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
+
 # ---------------------------
 # Logging
 # ---------------------------
@@ -229,14 +236,76 @@ async def run_claude(
         env=env,
     )
 
+    # Idle watchdog: poll the transcript directory for the workdir, kill
+    # proc if no .jsonl mtime updates for threshold seconds.
+    # --output-format json keeps stdout silent until the end, so we can't
+    # watch the pipe; transcript file mtime is the reliable activity signal.
+    wd_cfg = config.get("idle_watchdog") or {}
+    wd_enabled = bool(wd_cfg.get("enabled", IDLE_WATCHDOG_DEFAULT_ENABLED))
+    wd_threshold = float(wd_cfg.get("threshold_seconds", IDLE_WATCHDOG_DEFAULT_THRESHOLD))
+    wd_poll = float(wd_cfg.get("poll_interval_seconds", IDLE_WATCHDOG_DEFAULT_POLL))
+    transcript_dir = CLAUDE_PROJECTS_ROOT / workdir.replace("/", "-")
+    watchdog_stop = asyncio.Event()
+    watchdog_state = {"killed_idle": False}
+
+    async def _idle_watchdog() -> None:
+        last_activity = t_start
+        while not watchdog_stop.is_set():
+            try:
+                await asyncio.wait_for(watchdog_stop.wait(), timeout=wd_poll)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if transcript_dir.exists():
+                for p in transcript_dir.glob("*.jsonl"):
+                    try:
+                        m = p.stat().st_mtime
+                        if m > last_activity:
+                            last_activity = m
+                    except OSError:
+                        continue
+            idle = time.time() - last_activity
+            if idle > wd_threshold:
+                logger.warning(
+                    "Claude idle watchdog firing: %.1fs no transcript activity, killing",
+                    idle,
+                )
+                watchdog_state["killed_idle"] = True
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                return
+
+    watchdog_task: Optional[asyncio.Task] = (
+        asyncio.create_task(_idle_watchdog()) if wd_enabled else None
+    )
+
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
     except asyncio.TimeoutError:
-        proc.kill()
+        watchdog_stop.set()
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
         await proc.wait()
-        logger.warning("Claude timed out after %ds", timeout_seconds)
+        if watchdog_task is not None:
+            await watchdog_task
+        logger.warning("Claude timed out after %ds (wall clock)", timeout_seconds)
         # Keep session_id so caller can retry with same session
         return "", session_id, f"Claude timeout after {timeout_seconds}s"
+
+    watchdog_stop.set()
+    if watchdog_task is not None:
+        await watchdog_task
+
+    if watchdog_state["killed_idle"]:
+        logger.warning(
+            "Claude killed by idle watchdog (>%.0fs no transcript activity)",
+            wd_threshold,
+        )
+        return "", session_id, f"Claude idle timeout after {wd_threshold:.0f}s"
 
     stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
