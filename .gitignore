@@ -8,3 +8,8 @@ __pycache__/
 mcp/node_modules/
 mcp/discord-mcp.json
 inbox/
+manifest.yaml
+install.sh
+uninstall.sh
+status.sh
+scripts/
