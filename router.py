@@ -397,7 +397,7 @@ def cron_matches(schedule: str, now: datetime) -> bool:
         and now.hour in _parse_cron_field(hour, 0, 23)
         and now.day in _parse_cron_field(dom, 1, 31)
         and now.month in _parse_cron_field(mon, 1, 12)
-        and now.weekday() in _parse_cron_field(dow, 0, 6)  # 0=Monday
+        and (now.weekday() + 1) % 7 in _parse_cron_field(dow, 0, 6)  # cron: 0=Sunday, Python: 0=Monday
     )
 
 
