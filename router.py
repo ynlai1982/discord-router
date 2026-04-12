@@ -132,15 +132,19 @@ def get_channel_cfg(channel_id: int) -> Optional[Dict[str, Any]]:
     return cfg
 
 
-def build_prompt(user_text: str, cfg: Dict[str, Any]) -> str:
+def build_prompt(user_text: str, cfg: Dict[str, Any], channel_id: str = "") -> str:
     """Prepend channel/purpose prefix to user message, unless channel is 'main'."""
     name = cfg.get("name", "unknown")
     if name == "main":
         return user_text
     purpose = cfg.get("purpose")
+    parts = [f"頻道: {name}"]
+    if channel_id:
+        parts.append(f"chat_id: {channel_id}")
     if purpose:
-        return f"[頻道: {name} | 用途: {purpose}]\n{user_text}"
-    return f"[頻道: {name}]\n{user_text}"
+        parts.append(f"用途: {purpose}")
+    prefix = " | ".join(parts)
+    return f"[{prefix}]\n{user_text}"
 
 
 async def get_session(group: str) -> Optional[str]:
@@ -456,7 +460,7 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             workdir = _resolve_group_workdir(group)
             model = job.get("model") or cfg.get("model")
             timeout_seconds = int(job.get("timeout_seconds", cfg.get("timeout_seconds", 300)))
-            prompt = build_prompt(prompt_text, cfg)
+            prompt = build_prompt(prompt_text, cfg, channel_id)
 
             group_lock = get_group_lock(group)
             try:
@@ -575,7 +579,7 @@ class RouterClient(discord.Client):
         workdir = _resolve_group_workdir(group)
         model = cfg.get("model")
         timeout_seconds = int(cfg.get("timeout_seconds", 180))
-        prompt = build_prompt(user_text, cfg)
+        prompt = build_prompt(user_text, cfg, channel_id)
 
         logger.info(
             "Message from %s in %s (%s) [group=%s]: %s",
@@ -625,20 +629,58 @@ class RouterClient(discord.Client):
             await message.channel.send(f"Error: workdir not found: {workdir}")
 
 
+def _get_memory_env() -> dict:
+    """Read OPENAI_API_KEY from ~/.mcp.json (same source Claude Code uses)."""
+    mcp_json = Path.home() / ".mcp.json"
+    if mcp_json.exists():
+        try:
+            data = json.loads(mcp_json.read_text(encoding="utf-8"))
+            servers = data.get("mcpServers")
+            if not isinstance(servers, dict):
+                raise ValueError("mcpServers is not a dict")
+            memory = servers.get("memory")
+            if not isinstance(memory, dict):
+                raise ValueError("memory is not a dict")
+            env = memory.get("env")
+            if not isinstance(env, dict):
+                raise ValueError("env is not a dict")
+            key = env.get("OPENAI_API_KEY", "")
+            if key:
+                return {"OPENAI_API_KEY": key}
+        except (json.JSONDecodeError, KeyError, ValueError, AttributeError, TypeError):
+            pass
+    # Fallback to environment
+    key = os.getenv("OPENAI_API_KEY", "")
+    return {"OPENAI_API_KEY": key} if key else {}
+
+
 def ensure_mcp_config() -> None:
     """Generate mcp/discord-mcp.json with the current absolute path to the
     fork. Regenerated on every router start so the file stays correct after
     a clone, move, or rename — no machine-specific path is committed."""
-    cfg = {
+    cfg: dict = {
         "mcpServers": {
             "discord": {
                 "command": "bun",
                 "args": ["run", str(MCP_SERVER_PATH)],
-            }
+            },
         }
     }
+
+    # Conditionally add memory MCP if server exists and key is available
+    memory_server = Path.home() / "mcp-memory-server" / "dist" / "index.js"
+    memory_env = _get_memory_env()
+    if memory_server.exists() and memory_env:
+        cfg["mcpServers"]["memory"] = {
+            "command": "node",
+            "args": [str(memory_server)],
+            "env": memory_env,
+        }
+
     MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     MCP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    # Restrict file permissions (contains API key)
+    MCP_CONFIG_PATH.chmod(0o600)
 
 
 def main() -> None:
