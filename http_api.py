@@ -302,7 +302,7 @@ def create_http_app(
     app["get_channel_cfg"] = get_channel_cfg
     app["split_chunks"] = split_chunks
     app["inbox_dir"] = inbox_dir
-    app.router.add_post("/healthz", _healthz)
+    app.router.add_get("/healthz", _healthz)
     app.router.add_post("/reply", _reply)
     app.router.add_post("/react", _react)
     app.router.add_post("/edit_message", _edit_message)

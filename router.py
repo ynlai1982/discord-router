@@ -160,6 +160,8 @@ async def touch_session(group: str, session_id: Optional[str]) -> None:
         row = _sessions.get(group, {})
         if session_id:
             row["session_id"] = session_id
+        else:
+            row.pop("session_id", None)
         row["last_active"] = int(time.time())
         _sessions[group] = row
         save_json(SESSIONS_PATH, _sessions)
@@ -459,7 +461,11 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             if last_fired.get(name) == now_key:
                 continue
 
-            if not cron_matches(schedule, now):
+            try:
+                if not cron_matches(schedule, now):
+                    continue
+            except Exception:
+                logger.exception("Cron job %s: invalid schedule %r, skipping", name, schedule)
                 continue
 
             last_fired[name] = now_key
