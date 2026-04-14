@@ -1,6 +1,11 @@
 {
   "env_file": "~/.claude/channels/discord/.env",
   "allowed_users": ["YOUR_DISCORD_USER_ID"],
+  "idle_watchdog": {
+    "enabled": true,
+    "threshold_seconds": 600,
+    "poll_interval_seconds": 5
+  },
   "cron_jobs": [
     {
       "name": "example-task",
@@ -10,10 +15,18 @@
       "timeout_seconds": 300
     },
     {
+      "name": "example-command",
+      "schedule": "0 7 * * *",
+      "channel_id": "CHANNEL_ID_1",
+      "command": "node scripts/aggregate.js",
+      "success_message": "Aggregation completed.",
+      "timeout_seconds": 60
+    },
+    {
       "name": "example-reminder",
       "schedule": "0 13 * * 1,3,5",
       "channel_id": "CHANNEL_ID_1",
-      "direct_message": "⏰ Your reminder message here (sent directly, no Claude involved)"
+      "direct_message": "Time to work out!"
     }
   ],
   "channels": {
@@ -22,13 +35,15 @@
       "session_group": "main",
       "workdir": "/path/to/project",
       "idle_timeout_min": 60,
-      "timeout_seconds": 300
+      "timeout_seconds": 600
     },
     "CHANNEL_ID_2": {
-      "name": "archive",
-      "session_group": "main",
-      "purpose": "Archive channel description",
-      "timeout_seconds": 300
+      "name": "dev-project",
+      "session_group": "dev",
+      "workdir": "/path/to/dev-project",
+      "purpose": "Development project channel",
+      "timeout_seconds": 600,
+      "daily_reset": false
     }
   }
 }

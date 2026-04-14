@@ -318,7 +318,18 @@ async def run_claude(
     if proc.returncode != 0:
         err = stderr or stdout or f"claude exited with code {proc.returncode}"
         logger.error("Claude error (exit %d, %.1fs): %s", proc.returncode, elapsed, err[:500])
-        return "", session_id, err
+        # Return friendly message instead of raw error dump
+        if "500" in err or "Internal server error" in err:
+            friendly_err = "⚠️ Claude API 伺服器暫時異常（500），晚點再試。"
+        elif "529" in err or "overloaded" in err.lower():
+            friendly_err = "⚠️ Claude API 目前過載（529），晚點再試。"
+        elif "rate_limit" in err.lower() or "429" in err:
+            friendly_err = "⚠️ Claude API 達到速率限制，稍後再試。"
+        elif "timeout" in err.lower():
+            friendly_err = f"⚠️ Claude 回應逾時（{timeout_seconds}s），晚點再試。"
+        else:
+            friendly_err = f"⚠️ Claude 執行錯誤（exit code {proc.returncode}），晚點再試。"
+        return "", session_id, friendly_err
 
     logger.info("Claude completed in %.1fs", elapsed)
 
@@ -344,6 +355,21 @@ async def run_claude(
     # Extract result and session_id from JSON
     result = payload.get("result", "")
     new_session_id = payload.get("session_id")
+
+    # BUG-3 fix: detect API errors in successful JSON responses (is_error=true)
+    # and return a friendly error message instead of raw JSON dump
+    if payload.get("is_error"):
+        raw_result = str(result) if result else ""
+        if "500" in raw_result or "Internal server error" in raw_result:
+            friendly = "⚠️ Claude API 伺服器暫時異常（500），晚點再試。"
+        elif "529" in raw_result or "overloaded" in raw_result.lower():
+            friendly = "⚠️ Claude API 目前過載（529），晚點再試。"
+        elif "rate_limit" in raw_result.lower() or "429" in raw_result:
+            friendly = "⚠️ Claude API 達到速率限制，稍後再試。"
+        else:
+            friendly = f"⚠️ Claude API 錯誤，晚點再試。"
+        logger.warning("Claude API error (is_error=true): %s", raw_result[:300])
+        return friendly, new_session_id or session_id, None
 
     if isinstance(result, (dict, list)):
         result = json.dumps(result, ensure_ascii=False, indent=2)
@@ -426,7 +452,8 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             prompt_text = job.get("prompt", "")
 
             direct_msg = job.get("direct_message")
-            if not schedule or not channel_id or (not prompt_text and not direct_msg):
+            command = job.get("command")
+            if not schedule or not channel_id or (not prompt_text and not direct_msg and not command):
                 continue
 
             if last_fired.get(name) == now_key:
@@ -449,6 +476,46 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                         logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
                 except Exception:
                     logger.exception("Cron job %s: direct message failed", name)
+                continue
+
+            # Command: run shell command without Claude, post result to Discord
+            if command:
+                try:
+                    discord_channel = client.get_channel(int(channel_id))
+                    if discord_channel is None:
+                        logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
+                        continue
+                    cmd_timeout = int(job.get("timeout_seconds", 120))
+                    proc = await asyncio.create_subprocess_shell(
+                        command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    try:
+                        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=cmd_timeout)
+                    except asyncio.TimeoutError:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        await proc.wait()
+                        logger.warning("Cron job %s: command timed out after %ds", name, cmd_timeout)
+                        await discord_channel.send(f"⚠️ `{name}` 指令逾時（{cmd_timeout}s）")
+                        continue
+                    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+                    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+                    success_msg = job.get("success_message")
+                    if proc.returncode == 0:
+                        output = success_msg or stdout or f"✅ `{name}` 完成"
+                        for chunk in split_chunks(output):
+                            await discord_channel.send(chunk)
+                        logger.info("Cron job %s: command completed (exit 0)", name)
+                    else:
+                        err_output = stderr or stdout or "unknown error"
+                        await discord_channel.send(f"⚠️ `{name}` 失敗 (exit {proc.returncode}): {err_output[:500]}")
+                        logger.warning("Cron job %s: command failed (exit %d)", name, proc.returncode)
+                except Exception:
+                    logger.exception("Cron job %s: command execution failed", name)
                 continue
 
             cfg = get_channel_cfg(int(channel_id))
