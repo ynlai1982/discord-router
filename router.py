@@ -155,14 +155,17 @@ async def get_session(group: str) -> Optional[str]:
         return row.get("session_id")
 
 
-async def touch_session(group: str, session_id: Optional[str]) -> None:
+async def touch_session(group: str, session_id: Optional[str], is_user: bool = False) -> None:
     async with _sessions_lock:
         row = _sessions.get(group, {})
         if session_id:
             row["session_id"] = session_id
         else:
             row.pop("session_id", None)
-        row["last_active"] = int(time.time())
+        now = int(time.time())
+        row["last_active"] = now
+        if is_user:
+            row["last_user_active"] = now
         _sessions[group] = row
         save_json(SESSIONS_PATH, _sessions)
 
@@ -194,6 +197,93 @@ async def daily_session_reset() -> None:
                 if reset_groups:
                     save_json(SESSIONS_PATH, _sessions)
                     logger.info("Daily 07:00 reset — cleared sessions for groups: %s", reset_groups)
+
+
+# ---------------------------
+# Session keepalive
+# ---------------------------
+async def session_keepalive(client: "RouterClient") -> None:
+    """Keep prompt cache warm by sending minimal prompts to idle sessions."""
+    ka_cfg = config.get("keepalive", {})
+    if not ka_cfg.get("enabled", False):
+        logger.info("Keepalive disabled.")
+        return
+
+    interval_min = int(ka_cfg.get("interval_minutes", 50))
+    max_idle_hours = float(ka_cfg.get("max_idle_hours", 3))
+    quiet_start = ka_cfg.get("quiet_start", "02:30")
+    quiet_end = ka_cfg.get("quiet_end", "07:00")
+    quiet_start_h, quiet_start_m = (int(x) for x in quiet_start.split(":"))
+    quiet_end_h, quiet_end_m = (int(x) for x in quiet_end.split(":"))
+
+    logger.info(
+        "Keepalive started: every %dmin, max idle %gh, quiet %s-%s",
+        interval_min, max_idle_hours, quiet_start, quiet_end,
+    )
+
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now(TZ_TAIPEI)
+        now_ts = int(time.time())
+
+        # Quiet hours check
+        now_minutes = now.hour * 60 + now.minute
+        quiet_start_minutes = quiet_start_h * 60 + quiet_start_m
+        quiet_end_minutes = quiet_end_h * 60 + quiet_end_m
+        if quiet_start_minutes <= quiet_end_minutes:
+            in_quiet = quiet_start_minutes <= now_minutes < quiet_end_minutes
+        else:
+            in_quiet = now_minutes >= quiet_start_minutes or now_minutes < quiet_end_minutes
+        if in_quiet:
+            continue
+
+        async with _sessions_lock:
+            groups_to_ping = []
+            for group, row in _sessions.items():
+                sid = row.get("session_id")
+                if not sid:
+                    continue
+                last_active = row.get("last_active", 0)
+                last_user = row.get("last_user_active", last_active)  # fallback for pre-upgrade sessions
+                idle_seconds = now_ts - last_active
+                user_idle_seconds = now_ts - last_user
+
+                # Only keepalive if user was active within max_idle_hours
+                if user_idle_seconds > max_idle_hours * 3600:
+                    continue
+                # Only keepalive if session has been idle for interval_min
+                if idle_seconds < interval_min * 60:
+                    continue
+
+                groups_to_ping.append((group, sid))
+
+        for group, _sid in groups_to_ping:
+            workdir = _resolve_group_workdir(group)
+            group_lock = get_group_lock(group)
+            try:
+                async with group_lock:
+                    # Re-read session inside lock to avoid overwriting a newer session_id
+                    current_sid = await get_session(group)
+                    if not current_sid:
+                        continue
+                    # Re-check idle state inside lock
+                    async with _sessions_lock:
+                        row = _sessions.get(group, {})
+                        la = row.get("last_active", 0)
+                        if int(time.time()) - la < interval_min * 60:
+                            continue  # activity happened while we waited for the lock
+                    logger.info("Keepalive: pinging group %s", group)
+                    _result, new_sid, _err = await run_claude(
+                        prompt="keepalive",
+                        session_id=current_sid,
+                        workdir=workdir,
+                        timeout_seconds=30,
+                    )
+                    # Update last_active but NOT last_user_active
+                    await touch_session(group, new_sid or current_sid, is_user=False)
+                    logger.info("Keepalive: group %s done", group)
+            except Exception:
+                logger.exception("Keepalive: group %s failed", group)
 
 
 # ---------------------------
@@ -591,11 +681,13 @@ class RouterClient(discord.Client):
         super().__init__(**kwargs)
         self.daily_reset_task: Optional[asyncio.Task] = None
         self.cron_task: Optional[asyncio.Task] = None
+        self.keepalive_task: Optional[asyncio.Task] = None
         self.http_api_task: Optional[asyncio.Task] = None
 
     async def setup_hook(self) -> None:
         self.daily_reset_task = asyncio.create_task(daily_session_reset())
         self.cron_task = asyncio.create_task(run_cron_jobs(self))
+        self.keepalive_task = asyncio.create_task(session_keepalive(self))
         self.http_api_task = asyncio.create_task(
             serve_http_api(
                 client=self,
@@ -687,7 +779,7 @@ class RouterClient(discord.Client):
                         logger.warning("Retry also timed out, clearing session")
                         new_session_id = None
 
-                await touch_session(group, new_session_id)
+                await touch_session(group, new_session_id, is_user=True)
 
                 if err:
                     output_text = f"Error: {err}"

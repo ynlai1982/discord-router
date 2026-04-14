@@ -6,6 +6,13 @@
     "threshold_seconds": 600,
     "poll_interval_seconds": 5
   },
+  "keepalive": {
+    "enabled": true,
+    "interval_minutes": 50,
+    "max_idle_hours": 3,
+    "quiet_start": "02:30",
+    "quiet_end": "07:00"
+  },
   "cron_jobs": [
     {
       "name": "example-task",
