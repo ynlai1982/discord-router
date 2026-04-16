@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import signal
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -100,6 +102,91 @@ _sessions: Dict[str, Any] = load_json(SESSIONS_PATH, {})
 _sessions_lock = asyncio.Lock()
 _group_locks: Dict[str, asyncio.Lock] = {}
 
+# Graceful drain state. Incremented around the whole request-handling region
+# (run_claude + touch_session + Discord send), not just the subprocess, so
+# SIGTERM from `launchctl kickstart -k` cannot fire between `run_claude` and
+# the Discord reply and drop the message.
+_inflight: int = 0
+_inflight_cond: Optional[asyncio.Condition] = None
+_draining: bool = False
+
+
+def _compute_drain_timeout() -> int:
+    """Drain must outlast the longest possible in-flight task; scan cron +
+    channel timeouts at import time, multiply by 2 to cover auto-retry on
+    timeout, and add a 60s buffer. Falls back to 1800 if config broken.
+
+    Known edge case: if multiple requests queue on the same session_group
+    (serialized by group_lock), total drain time can exceed this timeout.
+    In practice the only time we SIGTERM is config reload, and losing a
+    queued reply during reload is acceptable. Not worth dynamic scaling."""
+    candidates = [60]
+    for job in config.get("cron_jobs") or []:
+        try:
+            candidates.append(int(job.get("timeout_seconds", 0)))
+        except (TypeError, ValueError):
+            pass
+    for cfg in (config.get("channels") or {}).values():
+        try:
+            candidates.append(int(cfg.get("timeout_seconds", 0)))
+        except (TypeError, ValueError):
+            pass
+    max_single = max(max(candidates), 1800)
+    return max_single * 2 + 60
+
+
+DRAIN_TIMEOUT_SECONDS = _compute_drain_timeout()
+
+
+def _get_inflight_cond() -> asyncio.Condition:
+    global _inflight_cond
+    if _inflight_cond is None:
+        _inflight_cond = asyncio.Condition()
+    return _inflight_cond
+
+
+async def _inflight_enter() -> None:
+    global _inflight
+    cond = _get_inflight_cond()
+    async with cond:
+        _inflight += 1
+
+
+async def _inflight_exit() -> None:
+    global _inflight
+    cond = _get_inflight_cond()
+    async with cond:
+        _inflight -= 1
+        if _inflight <= 0:
+            cond.notify_all()
+
+
+async def drain_and_exit(reason: str) -> None:
+    """Wait for in-flight claude runs to finish, then exit so launchd restarts us.
+    Used instead of letting SIGTERM from `kickstart -k` drop in-flight replies."""
+    global _draining
+    if _draining:
+        return
+    _draining = True
+    logger.info("Drain initiated (%s); %d in-flight", reason, _inflight)
+    cond = _get_inflight_cond()
+    try:
+        async with cond:
+            try:
+                await asyncio.wait_for(
+                    cond.wait_for(lambda: _inflight <= 0),
+                    timeout=DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Drain timed out after %ds with %d in-flight; exiting anyway",
+                    DRAIN_TIMEOUT_SECONDS, _inflight,
+                )
+    finally:
+        logger.info("Drain complete; exiting for reload")
+        # os._exit to bypass asyncio shutdown hangs; launchd KeepAlive respawns.
+        os._exit(0)
+
 
 # ---------------------------
 # Session group helpers
@@ -133,7 +220,11 @@ def get_channel_cfg(channel_id: int) -> Optional[Dict[str, Any]]:
 
 
 def build_prompt(user_text: str, cfg: Dict[str, Any], channel_id: str = "") -> str:
-    """Prepend channel/purpose prefix to user message, unless channel is 'main'."""
+    """Prepend channel/purpose prefix to user message, unless channel is 'main'.
+
+    若 channel config 設 warmup_skill，會在最前面加一行強制載入指令，
+    避免 claude 看到任務就衝、跳過 skill 查找。
+    """
     name = cfg.get("name", "unknown")
     if name == "main":
         return user_text
@@ -144,7 +235,19 @@ def build_prompt(user_text: str, cfg: Dict[str, Any], channel_id: str = "") -> s
     if purpose:
         parts.append(f"用途: {purpose}")
     prefix = " | ".join(parts)
-    return f"[{prefix}]\n{user_text}"
+
+    warmup_skill = cfg.get("warmup_skill")
+    warmup_line = ""
+    if warmup_skill:
+        # 白名單：只接受 skill_xxx.md 形式，避免 config 被改成 ../ 或含反引號/換行
+        # 做 prompt injection 時被濫用。
+        if re.fullmatch(r"[A-Za-z0-9_-]+\.md", warmup_skill):
+            skill_path = f"~/.claude/projects/-Users-mac-mini/memory/skills/{warmup_skill}"
+            warmup_line = f"[系統] 執行任務前先讀 skill 文件 `{skill_path}`，按流程處理。跳過會出錯。\n\n"
+        else:
+            logger.warning("Invalid warmup_skill (skipped): %r", warmup_skill)
+
+    return f"{warmup_line}[{prefix}]\n{user_text}"
 
 
 async def get_session(group: str) -> Optional[str]:
@@ -223,6 +326,10 @@ async def session_keepalive(client: "RouterClient") -> None:
 
     while True:
         await asyncio.sleep(60)
+        # Skip keepalive during drain to avoid spawning new claude subprocesses
+        # that delay shutdown or mutate sessions mid-reload.
+        if _draining:
+            continue
         now = datetime.now(TZ_TAIPEI)
         now_ts = int(time.time())
 
@@ -260,6 +367,7 @@ async def session_keepalive(client: "RouterClient") -> None:
         for group, _sid in groups_to_ping:
             workdir = _resolve_group_workdir(group)
             group_lock = get_group_lock(group)
+            await _inflight_enter()
             try:
                 async with group_lock:
                     # Re-read session inside lock to avoid overwriting a newer session_id
@@ -284,6 +392,8 @@ async def session_keepalive(client: "RouterClient") -> None:
                     logger.info("Keepalive: group %s done", group)
             except Exception:
                 logger.exception("Keepalive: group %s failed", group)
+            finally:
+                await _inflight_exit()
 
 
 # ---------------------------
@@ -324,6 +434,20 @@ async def run_claude(
     if extra_paths:
         env["PATH"] = extra_paths + ":" + env.get("PATH", "")
 
+    # Note: _inflight_enter/exit is NOT called here. Callers wrap the whole
+    # request-handling region (run_claude + touch_session + discord send) so
+    # drain doesn't fire between claude return and the Discord reply.
+    return await _run_claude_inner(args, env, workdir, session_id, timeout_seconds, t_start)
+
+
+async def _run_claude_inner(
+    args: List[str],
+    env: Dict[str, str],
+    workdir: str,
+    session_id: Optional[str],
+    timeout_seconds: int,
+    t_start: float,
+) -> Tuple[str, Optional[str], Optional[str]]:
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -537,6 +661,9 @@ async def run_cron_jobs(client: "RouterClient") -> None:
         now = datetime.now(TZ_TAIPEI)
         now_key = now.strftime("%Y-%m-%d %H:%M")
 
+        if _draining:
+            continue
+
         for job in cron_jobs:
             name = job.get("name", "unnamed")
             schedule = job.get("schedule", "")
@@ -563,6 +690,7 @@ async def run_cron_jobs(client: "RouterClient") -> None:
 
             # Direct message: send to Discord without running Claude
             if direct_msg:
+                await _inflight_enter()
                 try:
                     discord_channel = client.get_channel(int(channel_id))
                     if discord_channel:
@@ -572,10 +700,13 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                         logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
                 except Exception:
                     logger.exception("Cron job %s: direct message failed", name)
+                finally:
+                    await _inflight_exit()
                 continue
 
             # Command: run shell command without Claude, post result to Discord
             if command:
+                await _inflight_enter()
                 try:
                     discord_channel = client.get_channel(int(channel_id))
                     if discord_channel is None:
@@ -612,6 +743,8 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                         logger.warning("Cron job %s: command failed (exit %d)", name, proc.returncode)
                 except Exception:
                     logger.exception("Cron job %s: command execution failed", name)
+                finally:
+                    await _inflight_exit()
                 continue
 
             cfg = get_channel_cfg(int(channel_id))
@@ -626,6 +759,7 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             prompt = build_prompt(prompt_text, cfg, channel_id)
 
             group_lock = get_group_lock(group)
+            await _inflight_enter()
             try:
                 discord_channel = client.get_channel(int(channel_id))
                 if discord_channel is None:
@@ -671,6 +805,8 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                 logger.info("Cron job %s completed", name)
             except Exception:
                 logger.exception("Cron job %s failed", name)
+            finally:
+                await _inflight_exit()
 
 
 # ---------------------------
@@ -700,6 +836,19 @@ class RouterClient(discord.Client):
                 logger=logger,
             )
         )
+        # Graceful drain on SIGTERM/SIGHUP so `launchctl kickstart -k` doesn't
+        # chop in-flight claude subprocesses (and their pending /reply posts).
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                loop.add_signal_handler(
+                    sig,
+                    lambda s=sig: asyncio.create_task(
+                        drain_and_exit(f"signal {s.name}")
+                    ),
+                )
+            except (NotImplementedError, RuntimeError):
+                logger.warning("Could not install handler for %s", sig)
 
     async def on_ready(self) -> None:
         logger.info("Discord router online: %s (%s)", self.user, self.user.id if self.user else "?")
@@ -717,6 +866,14 @@ class RouterClient(discord.Client):
 
         cfg = get_channel_cfg(message.channel.id)
         if cfg is None:
+            return
+
+        if _draining:
+            logger.info("Drain active; bouncing message from %s", message.author)
+            try:
+                await message.channel.send("🔄 router 重新載入中，稍候再試")
+            except Exception:
+                pass
             return
 
         user_text = (message.content or "").strip()
@@ -753,6 +910,7 @@ class RouterClient(discord.Client):
 
         # Per-group lock prevents race condition on shared session_id
         group_lock = get_group_lock(group)
+        await _inflight_enter()
         try:
             async with group_lock, message.channel.typing():
                 session_id = await get_session(group)
@@ -792,6 +950,8 @@ class RouterClient(discord.Client):
         except FileNotFoundError:
             logger.error("workdir not found: %s", workdir)
             await message.channel.send(f"Error: workdir not found: {workdir}")
+        finally:
+            await _inflight_exit()
 
 
 def _get_memory_env() -> dict:
