@@ -233,6 +233,21 @@ async def _fetch_messages(request: web.Request) -> web.Response:
     return _json({"ok": True, "bot_user_id": bot_user_id, "messages": rows})
 
 
+async def _reset_session(request: web.Request) -> web.Response:
+    payload = await request.json()
+    chat_id = payload.get("chat_id")
+    not_allowlisted = _validate_channel_id(chat_id, request.app["get_channel_cfg"])
+    if not_allowlisted:
+        return not_allowlisted
+
+    reset = request.app["reset_session"]
+    try:
+        result = await reset(int(str(chat_id)))
+    except Exception as exc:
+        return _json({"ok": False, "error": str(exc)})
+    return _json({"ok": True, **result})
+
+
 async def _download_attachment(request: web.Request) -> web.Response:
     payload = await request.json()
     chat_id = payload.get("chat_id")
@@ -295,6 +310,7 @@ def create_http_app(
     get_channel_cfg: Callable[[int], Optional[Dict[str, Any]]],
     split_chunks: Callable[[str], List[str]],
     inbox_dir: str,
+    reset_session: Callable[[int], Any],
 ) -> web.Application:
     app = web.Application(middlewares=[_auth_middleware])
     app["client"] = client
@@ -302,12 +318,14 @@ def create_http_app(
     app["get_channel_cfg"] = get_channel_cfg
     app["split_chunks"] = split_chunks
     app["inbox_dir"] = inbox_dir
+    app["reset_session"] = reset_session
     app.router.add_get("/healthz", _healthz)
     app.router.add_post("/reply", _reply)
     app.router.add_post("/react", _react)
     app.router.add_post("/edit_message", _edit_message)
     app.router.add_post("/fetch_messages", _fetch_messages)
     app.router.add_post("/download_attachment", _download_attachment)
+    app.router.add_post("/reset_session", _reset_session)
     return app
 
 
@@ -317,6 +335,7 @@ async def serve_http_api(
     get_channel_cfg: Callable[[int], Optional[Dict[str, Any]]],
     split_chunks: Callable[[str], List[str]],
     inbox_dir: str,
+    reset_session: Callable[[int], Any],
     host: str,
     port: int,
     logger: Any,
@@ -328,6 +347,7 @@ async def serve_http_api(
             get_channel_cfg=get_channel_cfg,
             split_chunks=split_chunks,
             inbox_dir=inbox_dir,
+            reset_session=reset_session,
         )
         runner = web.AppRunner(app)
         await runner.setup()

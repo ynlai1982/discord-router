@@ -60,7 +60,7 @@ def load_json(path: Path, default: Any) -> Any:
 
 def save_json(path: Path, data: Any) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     tmp.replace(path)
 
 
@@ -102,40 +102,17 @@ _sessions: Dict[str, Any] = load_json(SESSIONS_PATH, {})
 _sessions_lock = asyncio.Lock()
 _group_locks: Dict[str, asyncio.Lock] = {}
 
-# Graceful drain state. Incremented around the whole request-handling region
-# (run_claude + touch_session + Discord send), not just the subprocess, so
-# SIGTERM from `launchctl kickstart -k` cannot fire between `run_claude` and
-# the Discord reply and drop the message.
+# Graceful drain state. Incremented only around the short Discord send/update
+# portion after Claude returns. Drain protects replies already ready to post;
+# Claude subprocesses may be cancelled by SIGTERM during reload.
 _inflight: int = 0
 _inflight_cond: Optional[asyncio.Condition] = None
 _draining: bool = False
 
 
-def _compute_drain_timeout() -> int:
-    """Drain must outlast the longest possible in-flight task; scan cron +
-    channel timeouts at import time, multiply by 2 to cover auto-retry on
-    timeout, and add a 60s buffer. Falls back to 1800 if config broken.
-
-    Known edge case: if multiple requests queue on the same session_group
-    (serialized by group_lock), total drain time can exceed this timeout.
-    In practice the only time we SIGTERM is config reload, and losing a
-    queued reply during reload is acceptable. Not worth dynamic scaling."""
-    candidates = [60]
-    for job in config.get("cron_jobs") or []:
-        try:
-            candidates.append(int(job.get("timeout_seconds", 0)))
-        except (TypeError, ValueError):
-            pass
-    for cfg in (config.get("channels") or {}).values():
-        try:
-            candidates.append(int(cfg.get("timeout_seconds", 0)))
-        except (TypeError, ValueError):
-            pass
-    max_single = max(max(candidates), 1800)
-    return max_single * 2 + 60
-
-
-DRAIN_TIMEOUT_SECONDS = _compute_drain_timeout()
+# Discord sends should complete quickly; 30s is enough now that drain no
+# longer waits for Claude subprocess timeouts/retries.
+DRAIN_TIMEOUT_SECONDS = 30
 
 
 def _get_inflight_cond() -> asyncio.Condition:
@@ -162,8 +139,8 @@ async def _inflight_exit() -> None:
 
 
 async def drain_and_exit(reason: str) -> None:
-    """Wait for in-flight claude runs to finish, then exit so launchd restarts us.
-    Used instead of letting SIGTERM from `kickstart -k` drop in-flight replies."""
+    """Wait for in-flight Discord sends to finish, then exit so launchd restarts us.
+    Used instead of letting SIGTERM from `kickstart -k` drop ready replies."""
     global _draining
     if _draining:
         return
@@ -273,6 +250,25 @@ async def touch_session(group: str, session_id: Optional[str], is_user: bool = F
         save_json(SESSIONS_PATH, _sessions)
 
 
+async def reset_session_by_channel(channel_id: int) -> Dict[str, Any]:
+    """Clear a channel's session_id so the next message starts a fresh Claude session.
+    Holds group_lock to avoid clobbering an in-flight claude run."""
+    cfg = get_channel_cfg(channel_id)
+    if not cfg:
+        raise ValueError(f"channel {channel_id} not configured")
+    group = get_session_group(cfg)
+    group_lock = get_group_lock(group)
+    async with group_lock:
+        async with _sessions_lock:
+            row = _sessions.get(group, {})
+            old_sid = row.get("session_id")
+            row["session_id"] = None
+            _sessions[group] = row
+            save_json(SESSIONS_PATH, _sessions)
+    logger.info("Session reset: group=%s old_session_id=%s", group, old_sid)
+    return {"session_group": group, "old_session_id": old_sid}
+
+
 async def daily_session_reset() -> None:
     """Reset sessions daily at 07:00 Taipei time. Groups with daily_reset=false are skipped."""
     last_reset_date: Optional[str] = None
@@ -367,7 +363,6 @@ async def session_keepalive(client: "RouterClient") -> None:
         for group, _sid in groups_to_ping:
             workdir = _resolve_group_workdir(group)
             group_lock = get_group_lock(group)
-            await _inflight_enter()
             try:
                 async with group_lock:
                     # Re-read session inside lock to avoid overwriting a newer session_id
@@ -392,8 +387,6 @@ async def session_keepalive(client: "RouterClient") -> None:
                     logger.info("Keepalive: group %s done", group)
             except Exception:
                 logger.exception("Keepalive: group %s failed", group)
-            finally:
-                await _inflight_exit()
 
 
 # ---------------------------
@@ -434,9 +427,8 @@ async def run_claude(
     if extra_paths:
         env["PATH"] = extra_paths + ":" + env.get("PATH", "")
 
-    # Note: _inflight_enter/exit is NOT called here. Callers wrap the whole
-    # request-handling region (run_claude + touch_session + discord send) so
-    # drain doesn't fire between claude return and the Discord reply.
+    # Note: _inflight_enter/exit is NOT called here. Callers only enter
+    # inflight while posting Discord replies after Claude returns.
     return await _run_claude_inner(args, env, workdir, session_id, timeout_seconds, t_start)
 
 
@@ -759,7 +751,6 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             prompt = build_prompt(prompt_text, cfg, channel_id)
 
             group_lock = get_group_lock(group)
-            await _inflight_enter()
             try:
                 discord_channel = client.get_channel(int(channel_id))
                 if discord_channel is None:
@@ -779,7 +770,11 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                     # Auto-retry once on timeout (same session)
                     if err and "timeout" in err.lower():
                         logger.info("Cron job %s: timeout, retrying with same session...", name)
-                        await discord_channel.send("⏳ 重試中...")
+                        await _inflight_enter()
+                        try:
+                            await discord_channel.send("⏳ 重試中...")
+                        finally:
+                            await _inflight_exit()
                         result, new_session_id, err = await run_claude(
                             prompt=prompt,
                             session_id=session_id,
@@ -791,22 +786,24 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                             logger.warning("Cron job %s: retry also timed out, clearing session", name)
                             new_session_id = None
 
-                    await touch_session(group, new_session_id)
+                    await _inflight_enter()
+                    try:
+                        await touch_session(group, new_session_id)
 
-                    if err:
-                        output_text = f"Error: {err}"
-                        for chunk in split_chunks(output_text):
-                            await discord_channel.send(chunk)
-                    elif result:
-                        for chunk in split_chunks(result):
-                            await discord_channel.send(chunk)
-                    # else: empty result = Claude replied via MCP, skip
+                        if err:
+                            output_text = f"Error: {err}"
+                            for chunk in split_chunks(output_text):
+                                await discord_channel.send(chunk)
+                        elif result:
+                            for chunk in split_chunks(result):
+                                await discord_channel.send(chunk)
+                        # else: empty result = Claude replied via MCP, skip
+                    finally:
+                        await _inflight_exit()
 
                 logger.info("Cron job %s completed", name)
             except Exception:
                 logger.exception("Cron job %s failed", name)
-            finally:
-                await _inflight_exit()
 
 
 # ---------------------------
@@ -831,13 +828,14 @@ class RouterClient(discord.Client):
                 get_channel_cfg=get_channel_cfg,
                 split_chunks=split_chunks,
                 inbox_dir=INBOX_DIR,
+                reset_session=reset_session_by_channel,
                 host=HTTP_HOST,
                 port=HTTP_PORT,
                 logger=logger,
             )
         )
         # Graceful drain on SIGTERM/SIGHUP so `launchctl kickstart -k` doesn't
-        # chop in-flight claude subprocesses (and their pending /reply posts).
+        # interrupt Discord sends that are already ready to post.
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGHUP):
             try:
@@ -910,7 +908,6 @@ class RouterClient(discord.Client):
 
         # Per-group lock prevents race condition on shared session_id
         group_lock = get_group_lock(group)
-        await _inflight_enter()
         try:
             async with group_lock, message.channel.typing():
                 session_id = await get_session(group)
@@ -925,7 +922,11 @@ class RouterClient(discord.Client):
                 # Auto-retry once on timeout (same session)
                 if err and "timeout" in err.lower():
                     logger.info("Timeout detected, retrying with same session...")
-                    await message.channel.send("⏳ 重試中...")
+                    await _inflight_enter()
+                    try:
+                        await message.channel.send("⏳ 重試中...")
+                    finally:
+                        await _inflight_exit()
                     result, new_session_id, err = await run_claude(
                         prompt=prompt,
                         session_id=session_id,
@@ -937,21 +938,27 @@ class RouterClient(discord.Client):
                         logger.warning("Retry also timed out, clearing session")
                         new_session_id = None
 
-                await touch_session(group, new_session_id, is_user=True)
+                await _inflight_enter()
+                try:
+                    await touch_session(group, new_session_id, is_user=True)
 
-                if err:
-                    output_text = f"Error: {err}"
-                    for chunk in split_chunks(output_text):
-                        await message.channel.send(chunk)
-                elif result:
-                    for chunk in split_chunks(result):
-                        await message.channel.send(chunk)
-                # else: empty result = Claude replied via MCP, skip
+                    if err:
+                        output_text = f"Error: {err}"
+                        for chunk in split_chunks(output_text):
+                            await message.channel.send(chunk)
+                    elif result:
+                        for chunk in split_chunks(result):
+                            await message.channel.send(chunk)
+                    # else: empty result = Claude replied via MCP, skip
+                finally:
+                    await _inflight_exit()
         except FileNotFoundError:
             logger.error("workdir not found: %s", workdir)
-            await message.channel.send(f"Error: workdir not found: {workdir}")
-        finally:
-            await _inflight_exit()
+            await _inflight_enter()
+            try:
+                await message.channel.send(f"Error: workdir not found: {workdir}")
+            finally:
+                await _inflight_exit()
 
 
 def _get_memory_env() -> dict:
@@ -1003,7 +1010,7 @@ def ensure_mcp_config() -> None:
         }
 
     MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MCP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
+    MCP_CONFIG_PATH.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     # Restrict file permissions (contains API key)
     MCP_CONFIG_PATH.chmod(0o600)
 
