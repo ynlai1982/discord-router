@@ -398,15 +398,22 @@ async def run_claude(
     workdir: str,
     model: Optional[str] = None,
     timeout_seconds: int = 180,
+    stream_mode: bool = False,
+    progress_callback: Optional[Any] = None,
+    idle_threshold_seconds: Optional[int] = None,
+    channel_name: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str]]:
     args = [
         "claude",
         "--print",
-        "--output-format", "json",
         "--dangerously-skip-permissions",
         "--mcp-config", str(MCP_CONFIG_PATH),
         "--strict-mcp-config",
     ]
+    if stream_mode:
+        args.extend(["--output-format", "stream-json", "--verbose"])
+    else:
+        args.extend(["--output-format", "json"])
 
     if session_id:
         args.extend(["--resume", session_id])
@@ -417,8 +424,8 @@ async def run_claude(
 
     t_start = time.time()
     logger.info(
-        "Running claude (channel workdir=%s, resume=%s, model=%s)",
-        workdir, bool(session_id), model,
+        "Running claude (channel workdir=%s, resume=%s, model=%s, stream=%s)",
+        workdir, bool(session_id), model, stream_mode,
     )
 
     env = os.environ.copy()
@@ -426,10 +433,224 @@ async def run_claude(
     extra_paths = os.getenv("CLAUDE_EXTRA_PATH", "")
     if extra_paths:
         env["PATH"] = extra_paths + ":" + env.get("PATH", "")
+    # Expose channel name to hooks (e.g. memory-recall.py reads CLAUDE_CHANNEL).
+    if channel_name:
+        env["CLAUDE_CHANNEL"] = channel_name
+    # Expose OPENAI_API_KEY for hooks that need to embed (memory-recall).
+    # Reads from ~/.mcp.json same as the MCP server config.
+    if not env.get("OPENAI_API_KEY"):
+        for k, v in _get_memory_env().items():
+            env.setdefault(k, v)
 
     # Note: _inflight_enter/exit is NOT called here. Callers only enter
     # inflight while posting Discord replies after Claude returns.
-    return await _run_claude_inner(args, env, workdir, session_id, timeout_seconds, t_start)
+    if stream_mode:
+        return await _run_claude_stream_inner(
+            args, env, workdir, session_id, timeout_seconds, t_start,
+            progress_callback, idle_threshold_seconds,
+        )
+    return await _run_claude_inner(
+        args, env, workdir, session_id, timeout_seconds, t_start,
+        idle_threshold_seconds,
+    )
+
+
+async def _run_claude_stream_inner(
+    args: List[str],
+    env: Dict[str, str],
+    workdir: str,
+    session_id: Optional[str],
+    timeout_seconds: int,
+    t_start: float,
+    progress_callback: Optional[Any] = None,
+    idle_threshold_seconds: Optional[int] = None,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Streaming variant: read stdout line-by-line, parse stream-json events,
+    log them as they arrive. Progress callback fired as fire-and-forget task
+    so Discord I/O latency does not stall the stdout drain (which would back
+    up Claude's pipe and indirectly cause timeouts)."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=workdir,
+        env=env,
+    )
+
+    final_result = ""
+    final_session_id = session_id
+    is_error = False
+    api_error_status = None
+    text_chunks: List[str] = []
+    event_counts = {"system": 0, "assistant_text": 0, "tool_use": 0, "tool_result": 0,
+                    "thinking": 0, "rate_limit_event": 0, "result": 0, "other": 0}
+
+    async def _drain_stderr() -> bytes:
+        if proc.stderr is None:
+            return b""
+        return await proc.stderr.read()
+
+    stderr_task = asyncio.create_task(_drain_stderr())
+
+    # Stream-mode idle threshold: time between stream events. Falls back to
+    # global config default if not overridden per channel/cron job.
+    wd_cfg = config.get("idle_watchdog") or {}
+    if idle_threshold_seconds is not None:
+        idle_thresh = float(idle_threshold_seconds)
+    else:
+        idle_thresh = float(wd_cfg.get("threshold_seconds", IDLE_WATCHDOG_DEFAULT_THRESHOLD))
+    idle_enabled = bool(wd_cfg.get("enabled", IDLE_WATCHDOG_DEFAULT_ENABLED))
+    killed_idle = {"value": False}
+
+    async def _read_events() -> None:
+        nonlocal final_result, final_session_id, is_error, api_error_status
+        if proc.stdout is None:
+            return
+        while True:
+            if idle_enabled:
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=idle_thresh)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[stream] idle watchdog firing: %.0fs no stream events, killing",
+                        idle_thresh,
+                    )
+                    killed_idle["value"] = True
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    return
+            else:
+                line = await proc.stdout.readline()
+            if not line:
+                return
+            line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                continue
+            try:
+                evt = json.loads(line_str)
+            except json.JSONDecodeError:
+                logger.warning("[stream] non-json line: %s", line_str[:200])
+                continue
+            etype = evt.get("type", "?")
+            if etype == "system":
+                event_counts["system"] += 1
+                sid = evt.get("session_id")
+                if sid:
+                    final_session_id = sid
+                logger.info("[stream/system] subtype=%s sid=%s",
+                            evt.get("subtype"), (sid or "")[:8])
+            elif etype == "rate_limit_event":
+                event_counts["rate_limit_event"] += 1
+                info = evt.get("rate_limit_info", {})
+                logger.info("[stream/rate_limit] status=%s overage=%s",
+                            info.get("status"), info.get("overageStatus"))
+            elif etype == "assistant":
+                msg = evt.get("message", {})
+                for c in msg.get("content", []) or []:
+                    ctype = c.get("type")
+                    if ctype == "text":
+                        text = c.get("text", "")
+                        text_chunks.append(text)
+                        event_counts["assistant_text"] += 1
+                        logger.info("[stream/text] %s", text[:200].replace("\n", " "))
+                    elif ctype == "tool_use":
+                        event_counts["tool_use"] += 1
+                        logger.info("[stream/tool_use] %s input=%s",
+                                    c.get("name"), str(c.get("input", {}))[:200])
+                        if progress_callback is not None:
+                            try:
+                                # Callback should be FAST (just sets a variable);
+                                # actual Discord I/O happens in a separate runner.
+                                await progress_callback("tool_use", {
+                                    "name": c.get("name"),
+                                    "input": c.get("input", {}),
+                                })
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                logger.warning("[stream] progress_cb error: %s", e)
+                    elif ctype == "thinking":
+                        event_counts["thinking"] += 1
+                        if progress_callback is not None:
+                            try:
+                                await progress_callback("thinking", {})
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                logger.warning("[stream] progress_cb error: %s", e)
+                    else:
+                        event_counts["other"] += 1
+            elif etype == "user":
+                msg = evt.get("message", {})
+                for c in msg.get("content", []) or []:
+                    if c.get("type") == "tool_result":
+                        event_counts["tool_result"] += 1
+                        out = c.get("content", "")
+                        if isinstance(out, list):
+                            out = " ".join(str(x.get("text", x))[:80] for x in out)
+                        logger.info("[stream/tool_result] %s", str(out)[:200].replace("\n", " "))
+            elif etype == "result":
+                event_counts["result"] += 1
+                final_result = evt.get("result", "") or ""
+                rsid = evt.get("session_id")
+                if rsid:
+                    final_session_id = rsid
+                if evt.get("is_error"):
+                    is_error = True
+                    api_error_status = evt.get("api_error_status")
+                logger.info("[stream/result] subtype=%s is_error=%s dur=%dms",
+                            evt.get("subtype"), is_error, evt.get("duration_ms", 0))
+            else:
+                event_counts["other"] += 1
+
+    try:
+        await asyncio.wait_for(_read_events(), timeout=timeout_seconds)
+        await proc.wait()
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        await stderr_task
+        elapsed = time.time() - t_start
+        logger.warning(
+            "[stream] timed out after %ds (wall clock); events=%s, accumulated_text=%dB",
+            timeout_seconds, event_counts, sum(len(t) for t in text_chunks),
+        )
+        return "", session_id, f"Claude timeout after {timeout_seconds}s"
+
+    if killed_idle["value"]:
+        await stderr_task
+        return "", final_session_id, f"Claude idle timeout after {idle_thresh:.0f}s"
+
+    stderr_b = await stderr_task
+    elapsed = time.time() - t_start
+    logger.info("[stream] completed in %.1fs; events=%s", elapsed, event_counts)
+
+    if proc.returncode != 0:
+        stderr_text = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+        err = stderr_text or final_result or f"claude exited with code {proc.returncode}"
+        logger.error("[stream] claude error (exit %d): %s", proc.returncode, err[:500])
+        return "", final_session_id, f"⚠️ Claude 執行錯誤（exit code {proc.returncode}）"
+
+    if is_error:
+        raw = str(final_result)
+        if "500" in raw or "Internal server error" in raw:
+            return "⚠️ Claude API 伺服器暫時異常（500），晚點再試。", final_session_id, None
+        if "529" in raw or "overloaded" in raw.lower():
+            return "⚠️ Claude API 目前過載（529），晚點再試。", final_session_id, None
+        if "rate_limit" in raw.lower() or "429" in raw:
+            return "⚠️ Claude API 達到速率限制，稍後再試。", final_session_id, None
+        return "⚠️ Claude API 錯誤，晚點再試。", final_session_id, None
+
+    # Prefer assembled text if `result` field is empty (defense; usually they match)
+    if not final_result and text_chunks:
+        final_result = "".join(text_chunks).strip()
+
+    return str(final_result).strip(), final_session_id, None
 
 
 async def _run_claude_inner(
@@ -439,6 +660,7 @@ async def _run_claude_inner(
     session_id: Optional[str],
     timeout_seconds: int,
     t_start: float,
+    idle_threshold_seconds: Optional[int] = None,
 ) -> Tuple[str, Optional[str], Optional[str]]:
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -448,13 +670,17 @@ async def _run_claude_inner(
         env=env,
     )
 
-    # Idle watchdog: poll the transcript directory for the workdir, kill
-    # proc if no .jsonl mtime updates for threshold seconds.
-    # --output-format json keeps stdout silent until the end, so we can't
-    # watch the pipe; transcript file mtime is the reliable activity signal.
+    # Idle watchdog: target THIS session's jsonl (not the whole transcript dir).
+    # Earlier version globbed all *.jsonl in the workdir, which let any other
+    # active session's writes mask this session being stuck. Now we lock onto
+    # the per-session file (or, for fresh resume=False sessions, the newest
+    # jsonl created after t_start once claude writes its system/init event).
     wd_cfg = config.get("idle_watchdog") or {}
     wd_enabled = bool(wd_cfg.get("enabled", IDLE_WATCHDOG_DEFAULT_ENABLED))
-    wd_threshold = float(wd_cfg.get("threshold_seconds", IDLE_WATCHDOG_DEFAULT_THRESHOLD))
+    if idle_threshold_seconds is not None:
+        wd_threshold = float(idle_threshold_seconds)
+    else:
+        wd_threshold = float(wd_cfg.get("threshold_seconds", IDLE_WATCHDOG_DEFAULT_THRESHOLD))
     wd_poll = float(wd_cfg.get("poll_interval_seconds", IDLE_WATCHDOG_DEFAULT_POLL))
     transcript_dir = CLAUDE_PROJECTS_ROOT / workdir.replace("/", "-")
     watchdog_stop = asyncio.Event()
@@ -462,25 +688,42 @@ async def _run_claude_inner(
 
     async def _idle_watchdog() -> None:
         last_activity = t_start
+        target_jsonl: Optional[Path] = (
+            transcript_dir / f"{session_id}.jsonl" if session_id else None
+        )
         while not watchdog_stop.is_set():
             try:
                 await asyncio.wait_for(watchdog_stop.wait(), timeout=wd_poll)
                 return
             except asyncio.TimeoutError:
                 pass
-            if transcript_dir.exists():
+            # Discover the jsonl for fresh sessions on first ticks where claude
+            # has had a chance to write its system/init event.
+            if target_jsonl is None and transcript_dir.exists():
+                best_p = None
+                best_m = 0.0
                 for p in transcript_dir.glob("*.jsonl"):
                     try:
-                        m = p.stat().st_mtime
-                        if m > last_activity:
-                            last_activity = m
+                        st = p.stat()
                     except OSError:
                         continue
+                    if st.st_ctime >= t_start - 1.0 and st.st_mtime > best_m:
+                        best_p = p
+                        best_m = st.st_mtime
+                if best_p is not None:
+                    target_jsonl = best_p
+            if target_jsonl is not None and target_jsonl.exists():
+                try:
+                    m = target_jsonl.stat().st_mtime
+                    if m > last_activity:
+                        last_activity = m
+                except OSError:
+                    pass
             idle = time.time() - last_activity
             if idle > wd_threshold:
                 logger.warning(
-                    "Claude idle watchdog firing: %.1fs no transcript activity, killing",
-                    idle,
+                    "Claude idle watchdog firing: %.1fs no jsonl activity (target=%s, threshold=%.0fs), killing",
+                    idle, target_jsonl.name if target_jsonl else "?", wd_threshold,
                 )
                 watchdog_state["killed_idle"] = True
                 try:
@@ -748,6 +991,12 @@ async def run_cron_jobs(client: "RouterClient") -> None:
             workdir = _resolve_group_workdir(group)
             model = job.get("model") or cfg.get("model")
             timeout_seconds = int(job.get("timeout_seconds", cfg.get("timeout_seconds", 300)))
+            # Idle threshold cascade: cron job > channel > global default
+            cron_idle = job.get("idle_threshold_seconds")
+            if cron_idle is None:
+                cron_idle = cfg.get("idle_threshold_seconds")
+            if cron_idle is not None:
+                cron_idle = int(cron_idle)
             prompt = build_prompt(prompt_text, cfg, channel_id)
 
             group_lock = get_group_lock(group)
@@ -765,6 +1014,8 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                         workdir=workdir,
                         model=model,
                         timeout_seconds=timeout_seconds,
+                        idle_threshold_seconds=cron_idle,
+                        channel_name=cfg.get("name"),
                     )
 
                     # Auto-retry once on timeout (same session)
@@ -781,6 +1032,8 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                             workdir=workdir,
                             model=model,
                             timeout_seconds=timeout_seconds,
+                            idle_threshold_seconds=cron_idle,
+                            channel_name=cfg.get("name"),
                         )
                         if err and "timeout" in err.lower():
                             logger.warning("Cron job %s: retry also timed out, clearing session", name)
@@ -900,6 +1153,10 @@ class RouterClient(discord.Client):
         model = cfg.get("model")
         timeout_seconds = int(cfg.get("timeout_seconds", 180))
         prompt = build_prompt(user_text, cfg, channel_id)
+        stream_mode = bool(cfg.get("streaming", False))
+        idle_threshold = cfg.get("idle_threshold_seconds")
+        if idle_threshold is not None:
+            idle_threshold = int(idle_threshold)
 
         logger.info(
             "Message from %s in %s (%s) [group=%s]: %s",
@@ -911,32 +1168,128 @@ class RouterClient(discord.Client):
         try:
             async with group_lock, message.channel.typing():
                 session_id = await get_session(group)
+
+                # Streaming mode: post status placeholder + start single edit-runner.
+                # progress_cb just updates `desired_status` (fast, no I/O); the runner
+                # is the only task that touches Discord, polling at fixed interval with
+                # latest-wins semantics. Stop runner cleanly before final edit so it
+                # can't overwrite the answer with a stale progress line.
+                status_msg = None
+                progress_cb = None
+                runner_task: Optional[asyncio.Task] = None
+                desired_status = ["🔄 思考中…"]
+                applied_status = [""]
+                EDIT_POLL_INTERVAL = 1.5  # seconds, Discord rate-limit safety
+
+                async def _stop_runner():
+                    nonlocal runner_task
+                    if runner_task is None:
+                        return
+                    runner_task.cancel()
+                    try:
+                        await runner_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        # Don't propagate — caller still needs to do the final edit.
+                        # But surface unexpected runner failures for debugging.
+                        logger.warning("edit runner exited with unexpected exception: %s", e)
+                    runner_task = None
+
+                if stream_mode:
+                    try:
+                        status_msg = await message.channel.send("🔄 思考中…")
+                        applied_status[0] = "🔄 思考中…"
+                    except Exception as e:
+                        logger.warning("Failed to post status placeholder: %s", e)
+                        status_msg = None
+
+                    if status_msg is not None:
+                        async def _edit_runner():
+                            while True:
+                                try:
+                                    await asyncio.sleep(EDIT_POLL_INTERVAL)
+                                except asyncio.CancelledError:
+                                    return
+                                if desired_status[0] == applied_status[0]:
+                                    continue
+                                target = desired_status[0]
+                                try:
+                                    await status_msg.edit(content=target)
+                                    applied_status[0] = target
+                                except asyncio.CancelledError:
+                                    return
+                                except Exception as e:
+                                    logger.warning("status edit failed: %s", e)
+
+                        runner_task = asyncio.create_task(_edit_runner())
+
+                    async def progress_cb(event_type: str, payload: Dict[str, Any]) -> None:
+                        # Fast path: just update the desired-state cell. No Discord I/O.
+                        # The edit runner picks this up on its next poll.
+                        if status_msg is None:
+                            return
+                        if event_type == "tool_use":
+                            tool = payload.get("name", "?")
+                            desired_status[0] = f"🛠️ {tool}…"
+                        elif event_type == "thinking":
+                            # Don't overwrite a more informative tool_use status with thinking
+                            if not desired_status[0].startswith("🛠️"):
+                                desired_status[0] = "💭 思考中…"
+
                 result, new_session_id, err = await run_claude(
                     prompt=prompt,
                     session_id=session_id,
                     workdir=workdir,
                     model=model,
                     timeout_seconds=timeout_seconds,
+                    stream_mode=stream_mode,
+                    progress_callback=progress_cb,
+                    idle_threshold_seconds=idle_threshold,
+                    channel_name=cfg.get("name"),
                 )
 
                 # Auto-retry once on timeout (same session)
                 if err and "timeout" in err.lower():
                     logger.info("Timeout detected, retrying with same session...")
+                    # Stop the edit runner so it can't race with our retry banner
+                    if stream_mode:
+                        await _stop_runner()
                     await _inflight_enter()
                     try:
-                        await message.channel.send("⏳ 重試中...")
+                        if status_msg is not None:
+                            try:
+                                await status_msg.edit(content="⏳ 重試中…")
+                                applied_status[0] = "⏳ 重試中…"
+                            except Exception:
+                                pass
+                        else:
+                            await message.channel.send("⏳ 重試中...")
                     finally:
                         await _inflight_exit()
+                    # Restart runner for the retry attempt
+                    if stream_mode and status_msg is not None:
+                        desired_status[0] = "⏳ 重試中…"
+                        runner_task = asyncio.create_task(_edit_runner())
                     result, new_session_id, err = await run_claude(
                         prompt=prompt,
                         session_id=session_id,
                         workdir=workdir,
                         model=model,
                         timeout_seconds=timeout_seconds,
+                        stream_mode=stream_mode,
+                        progress_callback=progress_cb,
+                        idle_threshold_seconds=idle_threshold,
+                        channel_name=cfg.get("name"),
                     )
                     if err and "timeout" in err.lower():
                         logger.warning("Retry also timed out, clearing session")
                         new_session_id = None
+
+                # Stop the progress runner BEFORE final edit so it can't race
+                # ahead and overwrite the answer with a stale progress line.
+                if stream_mode:
+                    await _stop_runner()
 
                 await _inflight_enter()
                 try:
@@ -944,12 +1297,36 @@ class RouterClient(discord.Client):
 
                     if err:
                         output_text = f"Error: {err}"
-                        for chunk in split_chunks(output_text):
-                            await message.channel.send(chunk)
+                        chunks = split_chunks(output_text)
+                        if status_msg is not None:
+                            try:
+                                await status_msg.edit(content=chunks[0])
+                            except Exception:
+                                await message.channel.send(chunks[0])
+                            for c in chunks[1:]:
+                                await message.channel.send(c)
+                        else:
+                            for c in chunks:
+                                await message.channel.send(c)
                     elif result:
-                        for chunk in split_chunks(result):
-                            await message.channel.send(chunk)
-                    # else: empty result = Claude replied via MCP, skip
+                        chunks = split_chunks(result)
+                        if status_msg is not None:
+                            try:
+                                await status_msg.edit(content=chunks[0])
+                            except Exception:
+                                await message.channel.send(chunks[0])
+                            for c in chunks[1:]:
+                                await message.channel.send(c)
+                        else:
+                            for c in chunks:
+                                await message.channel.send(c)
+                    else:
+                        # Empty result — Claude likely replied via MCP. Clean up status msg.
+                        if status_msg is not None:
+                            try:
+                                await status_msg.edit(content="✅")
+                            except Exception:
+                                pass
                 finally:
                     await _inflight_exit()
         except FileNotFoundError:
