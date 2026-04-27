@@ -13,3 +13,4 @@ install.sh
 uninstall.sh
 status.sh
 scripts/
+graphify-out/
