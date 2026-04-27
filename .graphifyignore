@@ -1,0 +1,8 @@
+inbox/
+sessions.json
+*.pdf
+*.html
+2026-04-08-*
+2026-04-20-*
+mcp/node_modules/
+scripts/_archived/
