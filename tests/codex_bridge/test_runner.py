@@ -91,6 +91,7 @@ class RunnerSubprocessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("--output-last-message", args)
         self.assertIn("--skip-git-repo-check", args)
         self.assertEqual(args[-1], "prompt text")
+        self.assertEqual(kwargs["stdin"], asyncio.subprocess.DEVNULL)
         self.assertEqual(kwargs["cwd"], tmp)
         self.assertTrue(kwargs["start_new_session"])
         self.assertEqual(result.text, "from-file")

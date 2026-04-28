@@ -56,6 +56,15 @@ def safe_error_message(error: str) -> str:
     return "Error: Codex failed. Check codex-discord-bridge.log for details."
 
 
+def looks_like_stale_session_error(error: str | None, stderr: str | None = None) -> bool:
+    text = f"{error or ''}\n{stderr or ''}".lower()
+    return (
+        ("thread" in text and "not found" in text)
+        or "thread/start failed" in text
+        or "failed to record rollout items" in text
+    )
+
+
 def user_error_chunks(error: str, limit: int | None = None) -> list[str]:
     text = safe_error_message(error)
     if limit is None:
@@ -131,6 +140,19 @@ class CodexBridgeClient(discord.Client):
 
             if result.stderr:
                 self.log.warning("codex stderr for group %s: %s", group, result.stderr.rstrip())
+
+            if result.error and looks_like_stale_session_error(result.error, result.stderr) and session_id:
+                self.log.warning("stale codex session for group %s, clearing and retrying fresh", group)
+                self.store.clear_groups([group])
+                result = await run_codex(
+                    prompt,
+                    None,
+                    str(cfg.get("workdir") or Path.home()),
+                    cfg.get("model"),
+                    int(cfg.get("timeout_seconds", 180)),
+                )
+                if result.stderr:
+                    self.log.warning("codex stderr for group %s after stale retry: %s", group, result.stderr.rstrip())
 
             if result.error:
                 self.log.error("codex error for group %s: %s", group, result.error)

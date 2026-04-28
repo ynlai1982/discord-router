@@ -9,6 +9,7 @@ from codex_bridge.bot import (
     channel_config,
     groups_for_daily_reset,
     is_daily_reset_time,
+    looks_like_stale_session_error,
     user_error_chunks,
 )
 from codex_bridge.config import BridgeConfig
@@ -44,6 +45,11 @@ class BotHelpersTests(unittest.TestCase):
     def test_user_error_chunks_sanitizes_non_timeout_error(self):
         chunks = user_error_chunks("secret path /tmp/private", limit=2000)
         self.assertEqual(chunks, ["Error: Codex failed. Check codex-discord-bridge.log for details."])
+
+    def test_looks_like_stale_session_error_detects_thread_not_found(self):
+        self.assertTrue(looks_like_stale_session_error("thread 123 not found"))
+        self.assertTrue(looks_like_stale_session_error(None, "failed to record rollout items: thread x not found"))
+        self.assertFalse(looks_like_stale_session_error("timeout"))
 
 
 class FakeTyping:
@@ -157,6 +163,30 @@ class BotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         sent = [call.args[0] for call in message.channel.send.await_args_list]
         self.assertEqual(sent, ["Error: Codex timed out. Session was reset; please try again."])
         self.assertEqual(store.cleared_groups, [["codex"]])
+
+    async def test_stale_session_error_clears_session_and_retries_fresh(self):
+        store = FakeStore()
+        client = make_client(store=store, locks={"codex": asyncio.Lock()})
+        message = make_message()
+        first = SimpleNamespace(
+            text="",
+            session_id="thread-1",
+            error="failed to record rollout items: thread thread-1 not found",
+            stderr="thread thread-1 not found",
+        )
+        second = SimpleNamespace(text="fresh ok", session_id="thread-2", error=None, stderr="")
+
+        run = mock.AsyncMock(side_effect=[first, second])
+        with mock.patch("codex_bridge.bot.run_codex", run):
+            await CodexBridgeClient.on_message(client, message)
+
+        self.assertEqual(run.await_count, 2)
+        self.assertEqual(run.await_args_list[0].args[1], "thread-1")
+        self.assertIsNone(run.await_args_list[1].args[1])
+        self.assertEqual(store.cleared_groups, [["codex"]])
+        self.assertEqual(store.touched, [("codex", "thread-2", True)])
+        sent = [call.args[0] for call in message.channel.send.await_args_list]
+        self.assertEqual(sent, ["fresh ok"])
 
     async def test_empty_message_returns_without_calling_codex(self):
         client = make_client(locks={"codex": asyncio.Lock()})
