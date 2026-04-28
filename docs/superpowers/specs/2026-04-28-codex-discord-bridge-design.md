@@ -125,7 +125,6 @@ class CodexRunResult:
     text: str
     session_id: str | None
     error: str | None
-    raw_events_path: Path | None
     stderr: str
 
 async def run_codex(
