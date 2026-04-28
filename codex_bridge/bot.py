@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from codex_bridge.sessions import SessionStore
 LOG_PATH = Path.home() / "Library" / "Logs" / "codex-discord-bridge.log"
 DEFAULT_CONFIG_PATH = "codex_bridge/config.json"
 TOKEN_ENV_VAR = "DISCORD_CODEX_BOT_TOKEN"
+TZ_TAIPEI = timezone(timedelta(hours=8))
 
 
 def channel_config(channels: dict[str, dict[str, Any]], channel_id: int | str) -> dict[str, Any] | None:
@@ -28,15 +30,31 @@ def channel_config(channels: dict[str, dict[str, Any]], channel_id: int | str) -
 
 def groups_for_daily_reset(channels: dict[str, dict[str, Any]]) -> list[str]:
     groups: list[str] = []
+    opt_out_groups: set[str] = set()
     seen: set[str] = set()
+
     for channel_id, cfg in channels.items():
-        if not cfg.get("daily_reset", True):
-            continue
         group = str(cfg.get("session_group") or cfg.get("name") or channel_id)
+        if not cfg.get("daily_reset", True):
+            opt_out_groups.add(group)
+            continue
         if group not in seen:
             seen.add(group)
             groups.append(group)
-    return groups
+
+    return [group for group in groups if group not in opt_out_groups]
+
+
+def is_daily_reset_time(daily_reset_hour: int, now: datetime | None = None) -> bool:
+    current = datetime.now(TZ_TAIPEI) if now is None else now.astimezone(TZ_TAIPEI)
+    return current.hour == daily_reset_hour and current.minute == 0
+
+
+def error_chunks(error: str, limit: int | None = None) -> list[str]:
+    text = f"Error: {error}"
+    if limit is None:
+        return split_chunks(text)
+    return split_chunks(text, limit=limit)
 
 
 def _setup_logging() -> None:
@@ -109,7 +127,8 @@ class CodexBridgeClient(discord.Client):
             if result.error:
                 if result.error == "timeout":
                     self.store.clear_groups([group])
-                await message.channel.send(f"Error: {result.error}")
+                for chunk in error_chunks(result.error):
+                    await message.channel.send(chunk)
                 return
 
             self.store.touch_session(group, result.session_id, is_user=True)
@@ -118,8 +137,7 @@ class CodexBridgeClient(discord.Client):
 
     @tasks.loop(minutes=1)
     async def bg_daily_reset(self) -> None:
-        now = discord.utils.utcnow()
-        if now.hour != self.cfg.daily_reset_hour or now.minute != 0:
+        if not is_daily_reset_time(self.cfg.daily_reset_hour):
             return
         groups = groups_for_daily_reset(self.cfg.channels)
         if groups:
