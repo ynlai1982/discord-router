@@ -13,4 +13,6 @@ install.sh
 uninstall.sh
 status.sh
 scripts/
+scripts
+.venv/
 graphify-out/
