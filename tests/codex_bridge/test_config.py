@@ -44,6 +44,20 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(cfg.allowed_users, {7})
 
+    def test_requires_allowed_users_list_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({
+                    "allowed_users": "123",
+                    "channels": {"123": {"name": "codex"}},
+                }),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                load_config(path)
+
     def test_requires_channels_object(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -51,6 +65,35 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_requires_daily_reset_bool_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({
+                    "allowed_users": [],
+                    "channels": {"123": {"name": "codex", "daily_reset": "false"}},
+                }),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                load_config(path)
+
+    def test_explicit_daily_reset_false_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({
+                    "allowed_users": [],
+                    "channels": {"123": {"name": "codex", "daily_reset": False}},
+                }),
+                encoding="utf-8",
+            )
+
+            cfg = load_config(path)
+
+        self.assertFalse(cfg.channels["123"]["daily_reset"])
 
 
 if __name__ == "__main__":

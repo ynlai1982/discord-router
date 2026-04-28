@@ -38,6 +38,10 @@ def load_config(path: str | Path) -> BridgeConfig:
     if not isinstance(raw_channels, dict):
         raise ValueError("channels must be an object")
 
+    raw_allowed_users = data.get("allowed_users", [])
+    if not isinstance(raw_allowed_users, list):
+        raise ValueError("allowed_users must be a list")
+
     env_file = data.get("env_file")
     env_path = Path(str(env_file)).expanduser() if env_file else None
     if env_path and env_path.exists():
@@ -57,13 +61,17 @@ def load_config(path: str | Path) -> BridgeConfig:
         cfg["session_group"] = str(cfg.get("session_group") or cfg["name"] or channel_id)
         cfg["workdir"] = str(Path(str(cfg.get("workdir") or Path.home())).expanduser())
         cfg["timeout_seconds"] = int(cfg.get("timeout_seconds", 180))
-        cfg["daily_reset"] = bool(cfg.get("daily_reset", True))
+        if "daily_reset" in cfg:
+            if not isinstance(cfg["daily_reset"], bool):
+                raise ValueError(f"channel {channel_id} daily_reset must be a bool")
+        else:
+            cfg["daily_reset"] = True
         channels[str(channel_id)] = cfg
 
     return BridgeConfig(
         path=config_path,
         env_file=env_path,
-        allowed_users=_to_int_set(list(data.get("allowed_users", []))),
+        allowed_users=_to_int_set(raw_allowed_users),
         sessions_file=sessions_path,
         daily_reset_hour=int(data.get("daily_reset_hour", 7)),
         channels=channels,
