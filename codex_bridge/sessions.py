@@ -18,7 +18,9 @@ class SessionStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(group): row for group, row in data.items() if isinstance(row, dict)}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +58,9 @@ class SessionStore:
 
     def clear_groups(self, groups: list[str]) -> None:
         for group in groups:
-            row = dict(self.data.get(group) or {})
+            if group not in self.data:
+                continue
+            row = dict(self.data[group])
             row["session_id"] = None
             self.data[group] = row
         self.save()
