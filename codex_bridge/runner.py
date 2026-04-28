@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +34,8 @@ def parse_events(path: Path) -> ParsedEvents:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(event, dict):
+            continue
 
         if event.get("type") == "thread.started" and event.get("thread_id"):
             session_id = str(event["thread_id"])
@@ -42,6 +46,45 @@ def parse_events(path: Path) -> ParsedEvents:
                 last_agent_message = item["text"]
 
     return ParsedEvents(session_id=session_id, last_agent_message=last_agent_message)
+
+
+def _build_args(prompt: str, session_id: str | None, model: str | None, output_path: Path) -> list[str]:
+    args = ["codex", "exec"]
+    if session_id:
+        args.extend(["resume", session_id])
+    args.extend(
+        [
+            "--skip-git-repo-check",
+            "--json",
+            "--output-last-message",
+            str(output_path),
+        ]
+    )
+    if model:
+        args.extend(["--model", model])
+    args.append(prompt)
+    return args
+
+
+def _signal_process_group(proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        return
+    except OSError:
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    _signal_process_group(proc, signal.SIGKILL)
+
+
+async def _stop_timed_out_process(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
+    _kill_process_group(proc)
+    return await proc.communicate()
 
 
 async def run_codex(
@@ -59,21 +102,7 @@ async def run_codex(
         tmpdir = Path(tmp)
         events_path = tmpdir / "events.jsonl"
         last_message_path = tmpdir / "last-message.txt"
-
-        args = ["codex", "exec"]
-        if session_id:
-            args.extend(["resume", session_id])
-        args.extend(
-            [
-                "--skip-git-repo-check",
-                "--json",
-                "--output-last-message",
-                str(last_message_path),
-            ]
-        )
-        if model:
-            args.extend(["--model", model])
-        args.append(prompt)
+        args = _build_args(prompt, session_id, model, last_message_path)
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -81,6 +110,7 @@ async def run_codex(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(cwd),
+                start_new_session=True,
             )
         except FileNotFoundError:
             return CodexRunResult("", session_id, "codex command not found", "")
@@ -88,8 +118,7 @@ async def run_codex(
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            proc.kill()
-            stdout, stderr = await proc.communicate()
+            stdout, stderr = await _stop_timed_out_process(proc)
             stderr_text = (stderr or b"").decode("utf-8", errors="replace")
             return CodexRunResult("", session_id, "timeout", stderr_text)
 
