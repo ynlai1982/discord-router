@@ -13,6 +13,13 @@ class DiscordUtilsTests(unittest.TestCase):
     def test_split_chunks_hard_splits_long_line(self):
         self.assertEqual(split_chunks("abcdefgh", limit=3), ["abc", "def", "gh"])
 
+    def test_split_chunks_rejects_non_positive_limit(self):
+        with self.assertRaisesRegex(ValueError, "limit must be positive"):
+            split_chunks("hello", limit=0)
+
+    def test_split_chunks_preserves_intentional_blank_line(self):
+        self.assertEqual(split_chunks("abc\n\ndef", limit=5), ["abc", "\ndef"])
+
     def test_build_prompt_main_channel_returns_user_text(self):
         cfg = {"name": "main"}
         self.assertEqual(build_prompt("hello", cfg, "123"), "hello")

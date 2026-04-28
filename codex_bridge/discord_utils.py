@@ -7,6 +7,9 @@ CHUNK_SIZE = 2000
 
 
 def split_chunks(text: str, limit: int = CHUNK_SIZE) -> list[str]:
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+
     if len(text) <= limit:
         return [text]
 
@@ -19,8 +22,11 @@ def split_chunks(text: str, limit: int = CHUNK_SIZE) -> list[str]:
         cut = remaining.rfind("\n", 0, limit - 1)
         if cut <= 0:
             cut = limit
+            next_start = cut
+        else:
+            next_start = cut + 1
         chunks.append(remaining[:cut])
-        remaining = remaining[cut:].lstrip("\n")
+        remaining = remaining[next_start:]
     return chunks
 
 
