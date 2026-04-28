@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+KILL_DRAIN_TIMEOUT_SECONDS = 5
+
+
 @dataclass(frozen=True)
 class ParsedEvents:
     session_id: str | None
@@ -84,7 +87,10 @@ def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
 
 async def _stop_timed_out_process(proc: asyncio.subprocess.Process) -> tuple[bytes, bytes]:
     _kill_process_group(proc)
-    return await proc.communicate()
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=KILL_DRAIN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return b"", b"process did not exit after kill"
 
 
 async def run_codex(

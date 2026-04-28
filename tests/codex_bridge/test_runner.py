@@ -194,6 +194,27 @@ class RunnerSubprocessTests(unittest.IsolatedAsyncioTestCase):
         kill_group.assert_called_once_with(proc)
         self.assertEqual(result.stderr, "late stderr")
 
+    async def test_run_codex_timeout_returns_when_post_kill_drain_times_out(self):
+        proc = FakeProcess()
+
+        async def hanging_communicate():
+            await asyncio.sleep(10)
+
+        proc.communicate = mock.AsyncMock(side_effect=hanging_communicate)
+
+        async def fake_create(*args, **kwargs):
+            return proc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(asyncio, "create_subprocess_exec", side_effect=fake_create):
+                with mock.patch.object(runner, "_kill_process_group") as kill_group:
+                    with mock.patch.object(runner, "KILL_DRAIN_TIMEOUT_SECONDS", 0.001):
+                        result = await run_codex("prompt text", None, tmp, None, 0.001)
+
+        self.assertEqual(result.error, "timeout")
+        self.assertEqual(result.stderr, "process did not exit after kill")
+        kill_group.assert_called_once_with(proc)
+
 
 if __name__ == "__main__":
     unittest.main()
