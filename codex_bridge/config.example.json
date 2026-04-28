@@ -1,0 +1,17 @@
+{
+  "env_file": "~/.codex/discord/.env",
+  "allowed_users": ["YOUR_DISCORD_USER_ID"],
+  "sessions_file": "codex_sessions.json",
+  "daily_reset_hour": 7,
+  "channels": {
+    "CHANNEL_ID": {
+      "name": "codex-main",
+      "session_group": "codex-main",
+      "workdir": "/Users/mac_mini",
+      "purpose": "Codex development assistant",
+      "timeout_seconds": 600,
+      "model": "gpt-5.5",
+      "daily_reset": true
+    }
+  }
+}
