@@ -7,7 +7,7 @@
     "CHANNEL_ID": {
       "name": "codex-main",
       "session_group": "codex-main",
-      "workdir": "/Users/mac_mini",
+      "workdir": "/path/to/project",
       "purpose": "Codex development assistant",
       "timeout_seconds": 600,
       "model": "gpt-5.5",

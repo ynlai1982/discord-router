@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -111,6 +112,31 @@ class RunnerSubprocessTests(unittest.IsolatedAsyncioTestCase):
         args, _kwargs = calls[0]
         self.assertEqual(args[:4], ("codex", "exec", "resume", "thread-1"))
         self.assertEqual(result.session_id, "thread-2")
+
+    async def test_run_codex_does_not_pass_discord_tokens_to_subprocess(self):
+        calls = []
+
+        async def fake_create(*args, **kwargs):
+            calls.append((args, kwargs))
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text("from-file", encoding="utf-8")
+            return FakeProcess()
+
+        token_env = {
+            "DISCORD_CODEX_BOT_TOKEN": "codex-token",
+            "DISCORD_BOT_TOKEN": "bot-token",
+            "DISCORD_ROUTER_TOKEN": "router-token",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, token_env):
+                with mock.patch.object(asyncio, "create_subprocess_exec", side_effect=fake_create):
+                    result = await run_codex("prompt text", None, tmp, None, 30)
+
+        _args, kwargs = calls[0]
+        self.assertNotIn("DISCORD_CODEX_BOT_TOKEN", kwargs["env"])
+        self.assertNotIn("DISCORD_BOT_TOKEN", kwargs["env"])
+        self.assertNotIn("DISCORD_ROUTER_TOKEN", kwargs["env"])
+        self.assertEqual(result.error, None)
 
     async def test_run_codex_prefers_last_message_file_over_jsonl_agent_message(self):
         async def fake_create(*args, **kwargs):

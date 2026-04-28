@@ -10,6 +10,17 @@ from pathlib import Path
 
 
 KILL_DRAIN_TIMEOUT_SECONDS = 5
+CODEX_ENV_ALLOWLIST = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "CODEX_HOME",
+    "OPENAI_API_KEY",
+}
 
 
 @dataclass(frozen=True)
@@ -69,6 +80,14 @@ def _build_args(prompt: str, session_id: str | None, model: str | None, output_p
     return args
 
 
+def _build_subprocess_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in CODEX_ENV_ALLOWLIST or key.startswith("LC_"):
+            env[key] = value
+    return env
+
+
 def _signal_process_group(proc: asyncio.subprocess.Process, sig: signal.Signals) -> None:
     try:
         os.killpg(proc.pid, sig)
@@ -116,6 +135,7 @@ async def run_codex(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(cwd),
+                env=_build_subprocess_env(),
                 start_new_session=True,
             )
         except FileNotFoundError:
