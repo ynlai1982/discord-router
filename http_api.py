@@ -13,6 +13,44 @@ from aiohttp import web
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_FILES_PER_REPLY = 10
 
+# Reply attachments must live under one of these roots. Resolved (symlinks
+# followed) so a symlink escape into ~/.ssh or similar is rejected.
+DEFAULT_REPLY_FILE_ROOTS = (
+    Path.home() / "discord-router" / "inbox",
+    Path.home() / "daily-reports",
+    Path("/tmp"),
+)
+
+
+def _allowed_reply_roots() -> List[Path]:
+    """Resolved allowlist of roots a reply attachment may live under.
+
+    Extra roots can be added at runtime via DISCORD_REPLY_ALLOWED_ROOTS
+    (colon-separated absolute paths).
+    """
+    candidates: List[Path] = list(DEFAULT_REPLY_FILE_ROOTS)
+    extra = os.environ.get("DISCORD_REPLY_ALLOWED_ROOTS", "")
+    for entry in extra.split(":"):
+        entry = entry.strip()
+        if entry:
+            candidates.append(Path(entry))
+
+    resolved: List[Path] = []
+    for root in candidates:
+        try:
+            resolved.append(root.resolve())
+        except (OSError, RuntimeError):
+            continue
+    return resolved
+
+
+def _is_under(child: Path, root: Path) -> bool:
+    try:
+        child.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
 
 def _json(data: Dict[str, Any], status: int = 200) -> web.Response:
     return web.json_response(data, status=status)
@@ -61,6 +99,7 @@ def _validate_reply_files(paths: Any) -> List[Path]:
     if len(paths) > MAX_FILES_PER_REPLY:
         raise ValueError(f"too many files: {len(paths)} > {MAX_FILES_PER_REPLY}")
 
+    allowed_roots = _allowed_reply_roots()
     validated: List[Path] = []
     for raw_path in paths:
         if not isinstance(raw_path, str):
@@ -72,6 +111,14 @@ def _validate_reply_files(paths: Any) -> List[Path]:
             raise ValueError(f"file not found: {raw_path}")
         if not path.is_file():
             raise ValueError(f"file is not a regular file: {raw_path}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            raise ValueError(f"file path could not be resolved: {raw_path}")
+        if not any(_is_under(resolved, root) for root in allowed_roots):
+            raise ValueError(
+                f"file path not within allowed roots: {raw_path}"
+            )
         size = path.stat().st_size
         if size > MAX_ATTACHMENT_BYTES:
             raise ValueError(
