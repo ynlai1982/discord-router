@@ -50,8 +50,14 @@ def is_daily_reset_time(daily_reset_hour: int, now: datetime | None = None) -> b
     return current.hour == daily_reset_hour and current.minute == 0
 
 
-def error_chunks(error: str, limit: int | None = None) -> list[str]:
-    text = f"Error: {error}"
+def safe_error_message(error: str) -> str:
+    if error == "timeout":
+        return "Error: Codex timed out. Session was reset; please try again."
+    return "Error: Codex failed. Check codex-discord-bridge.log for details."
+
+
+def user_error_chunks(error: str, limit: int | None = None) -> list[str]:
+    text = safe_error_message(error)
     if limit is None:
         return split_chunks(text)
     return split_chunks(text, limit=limit)
@@ -108,6 +114,8 @@ class CodexBridgeClient(discord.Client):
 
         group = str(cfg.get("session_group") or cfg.get("name") or message.channel.id)
         prompt_text = _message_text_with_attachments(message)
+        if not prompt_text:
+            return
         prompt = build_prompt(prompt_text, cfg, str(message.channel.id))
 
         async with self.locks[group]:
@@ -125,9 +133,10 @@ class CodexBridgeClient(discord.Client):
                 self.log.warning("codex stderr for group %s: %s", group, result.stderr.rstrip())
 
             if result.error:
+                self.log.error("codex error for group %s: %s", group, result.error)
                 if result.error == "timeout":
                     self.store.clear_groups([group])
-                for chunk in error_chunks(result.error):
+                for chunk in user_error_chunks(result.error):
                     await message.channel.send(chunk)
                 return
 
@@ -139,9 +148,14 @@ class CodexBridgeClient(discord.Client):
     async def bg_daily_reset(self) -> None:
         if not is_daily_reset_time(self.cfg.daily_reset_hour):
             return
+        await self.reset_daily_groups()
+
+    async def reset_daily_groups(self) -> None:
         groups = groups_for_daily_reset(self.cfg.channels)
+        for group in groups:
+            async with self.locks[group]:
+                self.store.clear_groups([group])
         if groups:
-            self.store.clear_groups(groups)
             self.log.info("daily reset cleared codex sessions for groups: %s", ", ".join(groups))
 
     @bg_daily_reset.before_loop
