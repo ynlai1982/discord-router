@@ -143,38 +143,6 @@ cd mcp && bun install && cd ..
 python router.py
 ```
 
-## Codex Discord Bridge
-
-This repository also includes an isolated Codex bridge under `codex_bridge/`.
-It is intentionally separate from the Claude router runtime while using the
-same channel/session concepts so it can later become a `codex` backend in a
-shared router.
-
-### Setup
-
-Copy the example config:
-
-```bash
-cp codex_bridge/config.example.json codex_bridge/config.json
-```
-
-Create the env file referenced by `codex_bridge/config.json`:
-
-```text
-DISCORD_CODEX_BOT_TOKEN=your_codex_bot_token
-```
-
-Run manually:
-
-```bash
-python3 -m codex_bridge.bot --config codex_bridge/config.json
-```
-
-The Codex bridge uses a separate bot token, session file, and log file from the
-Claude router. Local-only files are ignored by git:
-`codex_bridge/config.json` and `codex_bridge/codex_sessions.json`. Logs are
-written to `~/Library/Logs/codex-discord-bridge.log`.
-
 ### Running as a service (macOS)
 
 Create a LaunchAgent plist at `~/Library/LaunchAgents/com.discord-router.plist`:
@@ -216,6 +184,38 @@ Reload after changes:
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.discord-router
 ```
+
+## Codex Discord Bridge
+
+This repository also includes an isolated Codex bridge under `codex_bridge/`.
+It is intentionally separate from the Claude router runtime while using the
+same channel/session concepts so it can later become a `codex` backend in a
+shared router.
+
+### Setup
+
+Copy the example config:
+
+```bash
+cp codex_bridge/config.example.json codex_bridge/config.json
+```
+
+Create the env file referenced by `codex_bridge/config.json`:
+
+```text
+DISCORD_CODEX_BOT_TOKEN=your_codex_bot_token
+```
+
+Run manually:
+
+```bash
+python3 -m codex_bridge.bot --config codex_bridge/config.json
+```
+
+The Codex bridge uses a separate bot token, session file, and log file from the
+Claude router. Local-only files are ignored by git:
+`codex_bridge/config.json` and `codex_bridge/codex_sessions.json`. Logs are
+written to `~/Library/Logs/codex-discord-bridge.log`.
 
 ## Configuration Reference
 
