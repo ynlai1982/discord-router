@@ -475,6 +475,7 @@ async def _run_claude_stream_inner(
         stderr=asyncio.subprocess.PIPE,
         cwd=workdir,
         env=env,
+        limit=16 * 1024 * 1024,
     )
 
     final_result = ""
