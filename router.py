@@ -883,6 +883,185 @@ def cron_matches(schedule: str, now: datetime) -> bool:
     )
 
 
+def _cron_job_type(job: Dict[str, Any]) -> Optional[str]:
+    if job.get("direct_message"):
+        return "direct_message"
+    if job.get("command"):
+        return "command"
+    if job.get("prompt"):
+        return "prompt"
+    return None
+
+
+async def _run_direct_message_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
+    name = job.get("name", "unnamed")
+    channel_id = str(job.get("channel_id", ""))
+    direct_msg = job.get("direct_message")
+
+    try:
+        discord_channel = client.get_channel(int(channel_id))
+    except ValueError:
+        logger.warning("Cron job %s: invalid channel id %s", name, channel_id)
+        return
+
+    if discord_channel:
+        await discord_channel.send(direct_msg)
+        logger.info("Cron job %s: direct message sent", name)
+    else:
+        logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
+
+
+async def _run_command_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
+    name = job.get("name", "unnamed")
+    channel_id = str(job.get("channel_id", ""))
+    command = job.get("command")
+
+    try:
+        discord_channel = client.get_channel(int(channel_id))
+    except ValueError:
+        logger.warning("Cron job %s: invalid channel id %s", name, channel_id)
+        return
+
+    if discord_channel is None:
+        logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
+        return
+
+    cmd_timeout = int(job.get("timeout_seconds", 120))
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=cmd_timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        await proc.wait()
+        logger.warning("Cron job %s: command timed out after %ds", name, cmd_timeout)
+        await discord_channel.send(f"⚠️ `{name}` 指令逾時（{cmd_timeout}s）")
+        return
+
+    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
+    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+    success_msg = job.get("success_message")
+    if proc.returncode == 0:
+        output = success_msg or stdout or f"✅ `{name}` 完成"
+        for chunk in split_chunks(output):
+            await discord_channel.send(chunk)
+        logger.info("Cron job %s: command completed (exit 0)", name)
+    else:
+        err_output = stderr or stdout or "unknown error"
+        await discord_channel.send(f"⚠️ `{name}` 失敗 (exit {proc.returncode}): {err_output[:500]}")
+        logger.warning("Cron job %s: command failed (exit %d)", name, proc.returncode)
+
+
+async def _run_prompt_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
+    name = job.get("name", "unnamed")
+    channel_id = str(job.get("channel_id", ""))
+    prompt_text = job.get("prompt", "")
+
+    try:
+        numeric_channel_id = int(channel_id)
+    except ValueError:
+        logger.warning("Cron job %s: invalid channel id %s", name, channel_id)
+        return
+
+    cfg = get_channel_cfg(numeric_channel_id)
+    if cfg is None:
+        logger.warning("Cron job %s: channel %s not in config", name, channel_id)
+        return
+
+    discord_channel = client.get_channel(numeric_channel_id)
+    if discord_channel is None:
+        logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
+        return
+
+    group = get_session_group(cfg)
+    workdir = _resolve_group_workdir(group)
+    model = job.get("model") or cfg.get("model")
+    timeout_seconds = int(job.get("timeout_seconds", cfg.get("timeout_seconds", 300)))
+    cron_idle = job.get("idle_threshold_seconds")
+    if cron_idle is None:
+        cron_idle = cfg.get("idle_threshold_seconds")
+    if cron_idle is not None:
+        cron_idle = int(cron_idle)
+    prompt = build_prompt(prompt_text, cfg, channel_id)
+
+    group_lock = get_group_lock(group)
+    async with group_lock:
+        session_id = await get_session(group)
+        result, new_session_id, err = await run_claude(
+            prompt=prompt,
+            session_id=session_id,
+            workdir=workdir,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            idle_threshold_seconds=cron_idle,
+            channel_name=cfg.get("name"),
+        )
+
+        # Auto-retry once on timeout (same session)
+        if err and "timeout" in err.lower():
+            logger.info("Cron job %s: timeout, retrying with same session...", name)
+            await discord_channel.send("⏳ 重試中...")
+            result, new_session_id, err = await run_claude(
+                prompt=prompt,
+                session_id=session_id,
+                workdir=workdir,
+                model=model,
+                timeout_seconds=timeout_seconds,
+                idle_threshold_seconds=cron_idle,
+                channel_name=cfg.get("name"),
+            )
+            if err and "timeout" in err.lower():
+                logger.warning("Cron job %s: retry also timed out, clearing session", name)
+                new_session_id = None
+
+        await touch_session(group, new_session_id)
+
+        if err:
+            output_text = f"Error: {err}"
+            for chunk in split_chunks(output_text):
+                await discord_channel.send(chunk)
+        elif result:
+            for chunk in split_chunks(result):
+                await discord_channel.send(chunk)
+        # else: empty result = Claude replied via MCP, skip
+
+
+async def _run_one_cron_job(client: "RouterClient", job: Dict[str, Any], now_key: str) -> None:
+    name = job.get("name", "unnamed")
+    job_type = _cron_job_type(job)
+    channel_id = str(job.get("channel_id", ""))
+    logger.info(
+        "Cron task starting: %s type=%s channel=%s minute=%s",
+        name,
+        job_type,
+        channel_id,
+        now_key,
+    )
+
+    await _inflight_enter()
+    try:
+        if job_type == "direct_message":
+            await _run_direct_message_cron(client, job)
+        elif job_type == "command":
+            await _run_command_cron(client, job)
+        elif job_type == "prompt":
+            await _run_prompt_cron(client, job)
+        else:
+            logger.warning("Cron job %s: no runnable job type", name)
+            return
+        logger.info("Cron task completed: %s type=%s channel=%s minute=%s", name, job_type, channel_id, now_key)
+    except Exception:
+        logger.exception("Cron task failed: %s type=%s channel=%s minute=%s", name, job_type, channel_id, now_key)
+    finally:
+        await _inflight_exit()
+
+
 async def run_cron_jobs(client: "RouterClient") -> None:
     """Background task: check cron_jobs every 60s, fire matching ones."""
     if not cron_jobs:
@@ -921,143 +1100,19 @@ async def run_cron_jobs(client: "RouterClient") -> None:
                 logger.exception("Cron job %s: invalid schedule %r, skipping", name, schedule)
                 continue
 
+            job_type = _cron_job_type(job)
+            if job_type is None:
+                continue
+
             last_fired[name] = now_key
-            logger.info("Cron firing: %s -> channel %s", name, channel_id)
-
-            # Direct message: send to Discord without running Claude
-            if direct_msg:
-                await _inflight_enter()
-                try:
-                    discord_channel = client.get_channel(int(channel_id))
-                    if discord_channel:
-                        await discord_channel.send(direct_msg)
-                        logger.info("Cron job %s: direct message sent", name)
-                    else:
-                        logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
-                except Exception:
-                    logger.exception("Cron job %s: direct message failed", name)
-                finally:
-                    await _inflight_exit()
-                continue
-
-            # Command: run shell command without Claude, post result to Discord
-            if command:
-                await _inflight_enter()
-                try:
-                    discord_channel = client.get_channel(int(channel_id))
-                    if discord_channel is None:
-                        logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
-                        continue
-                    cmd_timeout = int(job.get("timeout_seconds", 120))
-                    proc = await asyncio.create_subprocess_shell(
-                        command,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                    )
-                    try:
-                        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=cmd_timeout)
-                    except asyncio.TimeoutError:
-                        try:
-                            proc.kill()
-                        except ProcessLookupError:
-                            pass
-                        await proc.wait()
-                        logger.warning("Cron job %s: command timed out after %ds", name, cmd_timeout)
-                        await discord_channel.send(f"⚠️ `{name}` 指令逾時（{cmd_timeout}s）")
-                        continue
-                    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-                    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
-                    success_msg = job.get("success_message")
-                    if proc.returncode == 0:
-                        output = success_msg or stdout or f"✅ `{name}` 完成"
-                        for chunk in split_chunks(output):
-                            await discord_channel.send(chunk)
-                        logger.info("Cron job %s: command completed (exit 0)", name)
-                    else:
-                        err_output = stderr or stdout or "unknown error"
-                        await discord_channel.send(f"⚠️ `{name}` 失敗 (exit {proc.returncode}): {err_output[:500]}")
-                        logger.warning("Cron job %s: command failed (exit %d)", name, proc.returncode)
-                except Exception:
-                    logger.exception("Cron job %s: command execution failed", name)
-                finally:
-                    await _inflight_exit()
-                continue
-
-            cfg = get_channel_cfg(int(channel_id))
-            if cfg is None:
-                logger.warning("Cron job %s: channel %s not in config", name, channel_id)
-                continue
-
-            group = get_session_group(cfg)
-            workdir = _resolve_group_workdir(group)
-            model = job.get("model") or cfg.get("model")
-            timeout_seconds = int(job.get("timeout_seconds", cfg.get("timeout_seconds", 300)))
-            # Idle threshold cascade: cron job > channel > global default
-            cron_idle = job.get("idle_threshold_seconds")
-            if cron_idle is None:
-                cron_idle = cfg.get("idle_threshold_seconds")
-            if cron_idle is not None:
-                cron_idle = int(cron_idle)
-            prompt = build_prompt(prompt_text, cfg, channel_id)
-
-            group_lock = get_group_lock(group)
-            try:
-                discord_channel = client.get_channel(int(channel_id))
-                if discord_channel is None:
-                    logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
-                    continue
-
-                async with group_lock:
-                    session_id = await get_session(group)
-                    result, new_session_id, err = await run_claude(
-                        prompt=prompt,
-                        session_id=session_id,
-                        workdir=workdir,
-                        model=model,
-                        timeout_seconds=timeout_seconds,
-                        idle_threshold_seconds=cron_idle,
-                        channel_name=cfg.get("name"),
-                    )
-
-                    # Auto-retry once on timeout (same session)
-                    if err and "timeout" in err.lower():
-                        logger.info("Cron job %s: timeout, retrying with same session...", name)
-                        await _inflight_enter()
-                        try:
-                            await discord_channel.send("⏳ 重試中...")
-                        finally:
-                            await _inflight_exit()
-                        result, new_session_id, err = await run_claude(
-                            prompt=prompt,
-                            session_id=session_id,
-                            workdir=workdir,
-                            model=model,
-                            timeout_seconds=timeout_seconds,
-                            idle_threshold_seconds=cron_idle,
-                            channel_name=cfg.get("name"),
-                        )
-                        if err and "timeout" in err.lower():
-                            logger.warning("Cron job %s: retry also timed out, clearing session", name)
-                            new_session_id = None
-
-                    await _inflight_enter()
-                    try:
-                        await touch_session(group, new_session_id)
-
-                        if err:
-                            output_text = f"Error: {err}"
-                            for chunk in split_chunks(output_text):
-                                await discord_channel.send(chunk)
-                        elif result:
-                            for chunk in split_chunks(result):
-                                await discord_channel.send(chunk)
-                        # else: empty result = Claude replied via MCP, skip
-                    finally:
-                        await _inflight_exit()
-
-                logger.info("Cron job %s completed", name)
-            except Exception:
-                logger.exception("Cron job %s failed", name)
+            logger.info(
+                "Cron dispatching: %s type=%s -> channel %s minute=%s",
+                name,
+                job_type,
+                channel_id,
+                now_key,
+            )
+            asyncio.create_task(_run_one_cron_job(client, job, now_key))
 
 
 # ---------------------------
