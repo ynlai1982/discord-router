@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import unittest
 from datetime import datetime, timezone
@@ -10,6 +12,7 @@ from codex_bridge.bot import (
     groups_for_daily_reset,
     is_daily_reset_time,
     looks_like_stale_session_error,
+    safe_error_message,
     user_error_chunks,
 )
 from codex_bridge.config import BridgeConfig
@@ -75,18 +78,29 @@ class FakeLock:
 
 
 class FakeStore:
-    def __init__(self):
-        self.cleared_groups = []
-        self.touched = []
+    def __init__(self, sessions: dict[str, str] | None = None):
+        self.cleared_groups: list[list[str]] = []
+        self.touched: list[tuple[str, str | None, bool]] = []
+        # Real backing dict so get_session reflects touch/clear and tests can
+        # actually prove session persistence end-to-end (not just hardcode).
+        # Use `is None` (not truthiness) so callers can pass an empty dict to
+        # represent a store with no prior sessions.
+        self.sessions: dict[str, str | None] = (
+            {"codex": "thread-1"} if sessions is None else dict(sessions)
+        )
 
     def get_session(self, group):
-        return "thread-1"
+        return self.sessions.get(group)
 
     def clear_groups(self, groups):
         self.cleared_groups.append(list(groups))
+        for group in groups:
+            self.sessions.pop(group, None)
 
     def touch_session(self, group, session_id, *, is_user):
         self.touched.append((group, session_id, is_user))
+        if session_id is not None:
+            self.sessions[group] = session_id
 
 
 def make_config():
@@ -151,7 +165,7 @@ class BotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         client.log.error.assert_called_once()
         self.assertIn("secret path", client.log.error.call_args.args[2])
 
-    async def test_timeout_error_clears_session_and_sends_timeout_safe_message(self):
+    async def test_timeout_preserves_session_and_sends_safe_message(self):
         store = FakeStore()
         client = make_client(store=store, locks={"codex": asyncio.Lock()})
         message = make_message()
@@ -161,8 +175,68 @@ class BotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await CodexBridgeClient.on_message(client, message)
 
         sent = [call.args[0] for call in message.channel.send.await_args_list]
-        self.assertEqual(sent, ["Error: Codex timed out. Session was reset; please try again."])
-        self.assertEqual(store.cleared_groups, [["codex"]])
+        self.assertEqual(sent, ["Error: Codex timed out. Session preserved; please try again."])
+        # Session_id MUST be preserved on timeout so the next message resumes the same
+        # Codex thread (mirrors Claude-side bridge behavior; per Task #119).
+        self.assertEqual(store.cleared_groups, [])
+        # And no fresh-session retry on plain timeout — only stale-thread errors retry.
+        self.assertEqual(store.touched, [])
+
+    async def test_timeout_then_next_message_resumes_same_session(self):
+        # End-to-end: a timeout leaves the saved session_id intact, so the next
+        # message's run_codex call receives the SAME session_id as resume target.
+        # FakeStore is backed by a real dict, so a regression that clears the
+        # session on timeout would cause the second run to receive None — which
+        # this test would then catch.
+        store = FakeStore(sessions={"codex": "thread-1"})
+        client = make_client(store=store, locks={"codex": asyncio.Lock()})
+        timeout_result = SimpleNamespace(
+            text="", session_id="thread-1", error="timeout", stderr=""
+        )
+        recovered = SimpleNamespace(
+            text="ok now", session_id="thread-1", error=None, stderr=""
+        )
+        run = mock.AsyncMock(side_effect=[timeout_result, recovered])
+
+        with mock.patch("codex_bridge.bot.run_codex", run):
+            await CodexBridgeClient.on_message(client, make_message())
+            # If timeout had cleared the store, the second on_message would call
+            # run_codex with session_id=None.
+            self.assertEqual(store.sessions.get("codex"), "thread-1")
+            await CodexBridgeClient.on_message(client, make_message())
+
+        # Both runs received "thread-1" as the resume target — timeout did not clear it.
+        self.assertEqual(run.await_args_list[0].args[1], "thread-1")
+        self.assertEqual(run.await_args_list[1].args[1], "thread-1")
+        self.assertEqual(store.cleared_groups, [])
+
+    async def test_first_message_timeout_uses_no_preserved_copy(self):
+        # No prior session — copy must NOT promise preservation.
+        store = FakeStore(sessions={})
+        client = make_client(store=store, locks={"codex": asyncio.Lock()})
+        message = make_message()
+        result = SimpleNamespace(text="", session_id=None, error="timeout", stderr="")
+
+        with mock.patch("codex_bridge.bot.run_codex", mock.AsyncMock(return_value=result)):
+            await CodexBridgeClient.on_message(client, message)
+
+        sent = [call.args[0] for call in message.channel.send.await_args_list]
+        self.assertEqual(sent, ["Error: Codex timed out. Please try again."])
+        self.assertNotIn("preserved", sent[0])
+        self.assertEqual(store.cleared_groups, [])
+
+    async def test_timeout_error_text_does_not_claim_reset(self):
+        # Honest copy: must not say the session was reset when in fact it was preserved.
+        # Covers the literal Chinese "重置" too in case the wording is ever localized.
+        forbidden_substrings = ("reset", "Reset", "RESET", "重置", "重設", "清空", "clear")
+        for had_session in (True, False):
+            text = safe_error_message("timeout", had_session=had_session)
+            for needle in forbidden_substrings:
+                self.assertNotIn(
+                    needle,
+                    text,
+                    f"timeout copy (had_session={had_session}) must not contain {needle!r}: {text!r}",
+                )
 
     async def test_stale_session_error_clears_session_and_retries_fresh(self):
         store = FakeStore()

@@ -50,9 +50,11 @@ def is_daily_reset_time(daily_reset_hour: int, now: datetime | None = None) -> b
     return current.hour == daily_reset_hour and current.minute == 0
 
 
-def safe_error_message(error: str) -> str:
+def safe_error_message(error: str, *, had_session: bool = False) -> str:
     if error == "timeout":
-        return "Error: Codex timed out. Session was reset; please try again."
+        if had_session:
+            return "Error: Codex timed out. Session preserved; please try again."
+        return "Error: Codex timed out. Please try again."
     return "Error: Codex failed. Check codex-discord-bridge.log for details."
 
 
@@ -65,8 +67,8 @@ def looks_like_stale_session_error(error: str | None, stderr: str | None = None)
     )
 
 
-def user_error_chunks(error: str, limit: int | None = None) -> list[str]:
-    text = safe_error_message(error)
+def user_error_chunks(error: str, limit: int | None = None, *, had_session: bool = False) -> list[str]:
+    text = safe_error_message(error, had_session=had_session)
     if limit is None:
         return split_chunks(text)
     return split_chunks(text, limit=limit)
@@ -129,6 +131,10 @@ class CodexBridgeClient(discord.Client):
 
         async with self.locks[group]:
             session_id = self.store.get_session(group)
+            # Snapshot whether we entered this turn with a session to preserve. Used
+            # only for honest user-facing copy on errors; do not conflate with
+            # whether run_codex established a new thread on this run.
+            had_prior_session = bool(session_id)
             async with message.channel.typing():
                 result = await run_codex(
                     prompt,
@@ -144,6 +150,9 @@ class CodexBridgeClient(discord.Client):
             if result.error and looks_like_stale_session_error(result.error, result.stderr) and session_id:
                 self.log.warning("stale codex session for group %s, clearing and retrying fresh", group)
                 self.store.clear_groups([group])
+                # We just cleared the prior session; the retry runs fresh, so any
+                # subsequent error on this turn no longer has a session to preserve.
+                had_prior_session = False
                 result = await run_codex(
                     prompt,
                     None,
@@ -156,9 +165,15 @@ class CodexBridgeClient(discord.Client):
 
             if result.error:
                 self.log.error("codex error for group %s: %s", group, result.error)
-                if result.error == "timeout":
-                    self.store.clear_groups([group])
-                for chunk in user_error_chunks(result.error):
+                # Timeout preserves session_id so the next message resumes the same Codex
+                # thread (mirrors Claude-side bridge behavior). Hard stale-thread errors
+                # are handled above and clear the session before retrying.
+                # NOTE: this branch only preserves a session that already existed before
+                # the call; first-message timeouts cannot persist a new thread_id because
+                # run_codex does not parse partial events on timeout. The user-facing
+                # copy reflects this (had_prior_session => "Session preserved", else
+                # "Please try again." — no false promise).
+                for chunk in user_error_chunks(result.error, had_session=had_prior_session):
                     await message.channel.send(chunk)
                 return
 
