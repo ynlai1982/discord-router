@@ -121,6 +121,54 @@ class CommandCronTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(channel.sent, ["done"])
 
+    async def test_run_command_cron_silent_success_skips_empty_output(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return FakeProcess(stdout=b"", returncode=0)
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "ready-dispatch",
+                    "channel_id": "123",
+                    "command": "python3 ready-dispatcher.py",
+                    "silent_success": True,
+                },
+            )
+
+        self.assertEqual(channel.sent, [])
+
+    async def test_run_command_cron_silent_success_still_posts_stdout(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return FakeProcess(stdout=b"spawned card_id=1\n", returncode=0)
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "ready-dispatch",
+                    "channel_id": "123",
+                    "command": "python3 ready-dispatcher.py",
+                    "silent_success": True,
+                },
+            )
+
+        self.assertEqual(channel.sent, ["spawned card_id=1"])
+
     async def test_run_command_cron_posts_failure(self):
         channel = FakeChannel()
         client = FakeClient(channel)

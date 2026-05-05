@@ -948,6 +948,9 @@ async def _run_command_cron(client: "RouterClient", job: Dict[str, Any]) -> None
     stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
     success_msg = job.get("success_message")
     if proc.returncode == 0:
+        if job.get("silent_success") and not success_msg and not stdout:
+            logger.info("Cron job %s: command completed silently (exit 0)", name)
+            return
         output = success_msg or stdout or f"✅ `{name}` 完成"
         for chunk in split_chunks(output):
             await discord_channel.send(chunk)
