@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from http_api import _validate_reply_files
+from http_api import _preflight_channel_payload, _run_prompt_cron_payload, _validate_reply_files
 
 
 class ValidateReplyFilesAllowlistTests(unittest.TestCase):
@@ -79,6 +79,121 @@ class ValidateReplyFilesAllowlistTests(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             _validate_reply_files(many)
         self.assertIn("too many files", str(cm.exception))
+
+class FakePermissions:
+    def __init__(self, *, send_messages=True, view_channel=True, read_message_history=True):
+        self.send_messages = send_messages
+        self.view_channel = view_channel
+        self.read_message_history = read_message_history
+
+
+class FakeGuild:
+    me = object()
+
+
+class FakeChannel:
+    guild = FakeGuild()
+
+    def __init__(self, permissions):
+        self.permissions = permissions
+
+    def permissions_for(self, member):
+        return self.permissions
+
+
+class FakeClient:
+    user = object()
+
+    def __init__(self, channel):
+        self.channel = channel
+
+    def get_channel(self, channel_id):
+        if channel_id == 123:
+            return self.channel
+        return None
+
+
+class PreflightChannelPayloadTests(unittest.TestCase):
+    def test_preflight_channel_reports_send_permission(self):
+        payload = _preflight_channel_payload(
+            client=FakeClient(FakeChannel(FakePermissions(send_messages=True))),
+            channel_id="123",
+            get_channel_cfg=lambda channel_id: {"name": "test"} if channel_id == 123 else None,
+            need_send=True,
+            need_read=False,
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["can_send"])
+
+    def test_preflight_channel_fails_loud_on_missing_send_permission(self):
+        payload = _preflight_channel_payload(
+            client=FakeClient(FakeChannel(FakePermissions(send_messages=False))),
+            channel_id="123",
+            get_channel_cfg=lambda channel_id: {"name": "test"} if channel_id == 123 else None,
+            need_send=True,
+            need_read=False,
+        )
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("Send Messages", payload["error"])
+
+    def test_preflight_channel_fails_loud_on_missing_read_permission(self):
+        payload = _preflight_channel_payload(
+            client=FakeClient(FakeChannel(FakePermissions(read_message_history=False))),
+            channel_id="123",
+            get_channel_cfg=lambda channel_id: {"name": "test"} if channel_id == 123 else None,
+            need_send=False,
+            need_read=True,
+        )
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("Read Message History", payload["error"])
+
+
+class RunPromptCronPayloadTests(unittest.TestCase):
+    def test_run_prompt_cron_payload_accepts_minimal_job(self):
+        job, error = _run_prompt_cron_payload(
+            {
+                "job_name": "daily-wrap-status",
+                "scheduled_minute": "2026-05-12 06:15",
+                "run_id": "run-1",
+                "channel_id": "333333333333333333",
+                "prompt": "do work",
+            }
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(job["name"], "daily-wrap-status")
+        self.assertEqual(job["channel_id"], "333333333333333333")
+        self.assertEqual(job["prompt"], "do work")
+
+    def test_run_prompt_cron_payload_rejects_missing_prompt(self):
+        job, error = _run_prompt_cron_payload(
+            {
+                "job_name": "daily-wrap-status",
+                "scheduled_minute": "2026-05-12 06:15",
+                "run_id": "run-1",
+                "channel_id": "333333333333333333",
+            }
+        )
+
+        self.assertIsNone(job)
+        self.assertIn("prompt", error)
+
+    def test_run_prompt_cron_payload_rejects_oversized_prompt(self):
+        job, error = _run_prompt_cron_payload(
+            {
+                "job_name": "daily-wrap-status",
+                "scheduled_minute": "2026-05-12 06:15",
+                "run_id": "run-1",
+                "channel_id": "333333333333333333",
+                "prompt": "x" * 32769,
+            }
+        )
+
+        self.assertIsNone(job)
+        self.assertIn("prompt too large", error)
 
 
 if __name__ == "__main__":

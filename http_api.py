@@ -12,6 +12,7 @@ from aiohttp import web
 
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_FILES_PER_REPLY = 10
+MAX_PROMPT_CRON_PROMPT_CHARS = 32 * 1024
 
 # Reply attachments must live under one of these roots. Resolved (symlinks
 # followed) so a symlink escape into ~/.ssh or similar is rejected.
@@ -89,6 +90,85 @@ def _get_text_channel(client: discord.Client, channel_id: str) -> Optional[disco
         return client.get_channel(int(channel_id))
     except Exception:
         return None
+
+
+def _preflight_channel_payload(
+    *,
+    client: discord.Client,
+    channel_id: Any,
+    get_channel_cfg: Callable[[int], Optional[Dict[str, Any]]],
+    need_send: bool,
+    need_read: bool,
+) -> Dict[str, Any]:
+    not_allowlisted = _validate_channel_id(channel_id, get_channel_cfg)
+    if not_allowlisted:
+        return {"ok": False, "error": f"channel {channel_id} not allowlisted"}
+
+    channel = _get_text_channel(client, str(channel_id))
+    if channel is None:
+        return {"ok": False, "error": f"channel {channel_id} not found"}
+
+    permissions_for = getattr(channel, "permissions_for", None)
+    guild = getattr(channel, "guild", None)
+    member = getattr(guild, "me", None) or getattr(client, "user", None)
+    if not callable(permissions_for) or member is None:
+        return {"ok": False, "error": f"channel {channel_id} permission inspection unavailable"}
+
+    permissions = permissions_for(member)
+    can_send = bool(getattr(permissions, "send_messages", False))
+    can_view = bool(getattr(permissions, "view_channel", False))
+    can_read_history = bool(getattr(permissions, "read_message_history", False))
+    missing = []
+    if need_send and not can_send:
+        missing.append("Send Messages")
+    if need_read and not can_view:
+        missing.append("View Channel")
+    if need_read and not can_read_history:
+        missing.append("Read Message History")
+
+    return {
+        "ok": not missing,
+        "error": f"missing {', '.join(missing)}" if missing else "",
+        "channel_id": str(channel_id),
+        "can_send": can_send,
+        "can_view": can_view,
+        "can_read_history": can_read_history,
+    }
+
+
+def _run_prompt_cron_payload(payload: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    required = ("job_name", "run_id", "scheduled_minute", "channel_id", "prompt")
+    for key in required:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None, f"{key} must be a non-empty string"
+
+    job: Dict[str, Any] = {
+        "name": payload["job_name"].strip(),
+        "run_id": payload["run_id"].strip(),
+        "scheduled_minute": payload["scheduled_minute"].strip(),
+        "channel_id": payload["channel_id"].strip(),
+        "prompt": payload["prompt"],
+    }
+    if len(job["prompt"]) > MAX_PROMPT_CRON_PROMPT_CHARS:
+        return None, f"prompt too large: {len(job['prompt'])} > {MAX_PROMPT_CRON_PROMPT_CHARS}"
+    for key in ("model",):
+        value = payload.get(key)
+        if value is not None:
+            if not isinstance(value, str) or not value.strip():
+                return None, f"{key} must be a non-empty string when provided"
+            job[key] = value.strip()
+    for key in ("timeout_seconds", "idle_threshold_seconds"):
+        value = payload.get(key)
+        if value is not None:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None, f"{key} must be an integer when provided"
+            if parsed <= 0:
+                return None, f"{key} must be positive when provided"
+            job[key] = parsed
+    return job, None
 
 
 def _validate_reply_files(paths: Any) -> List[Path]:
@@ -280,6 +360,37 @@ async def _fetch_messages(request: web.Request) -> web.Response:
     return _json({"ok": True, "bot_user_id": bot_user_id, "messages": rows})
 
 
+async def _preflight_channel(request: web.Request) -> web.Response:
+    payload = await request.json()
+    result = _preflight_channel_payload(
+        client=request.app["client"],
+        channel_id=payload.get("channel_id"),
+        get_channel_cfg=request.app["get_channel_cfg"],
+        need_send=bool(payload.get("need_send")),
+        need_read=bool(payload.get("need_read")),
+    )
+    return _json(result)
+
+
+async def _run_prompt_cron(request: web.Request) -> web.Response:
+    payload = await request.json()
+    job, error = _run_prompt_cron_payload(payload)
+    if error:
+        return _json({"ok": False, "error": error})
+
+    runner = request.app.get("run_prompt_cron")
+    if not callable(runner):
+        return _json({"ok": False, "error": "run_prompt_cron unavailable"})
+
+    try:
+        result = await runner(job)
+    except Exception as exc:
+        return _json({"ok": False, "status": "failed", "error": str(exc)})
+    if not isinstance(result, dict):
+        return _json({"ok": False, "status": "failed", "error": "run_prompt_cron returned invalid result"})
+    return _json(result)
+
+
 async def _reset_session(request: web.Request) -> web.Response:
     payload = await request.json()
     chat_id = payload.get("chat_id")
@@ -358,6 +469,7 @@ def create_http_app(
     split_chunks: Callable[[str], List[str]],
     inbox_dir: str,
     reset_session: Callable[[int], Any],
+    run_prompt_cron: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ) -> web.Application:
     app = web.Application(middlewares=[_auth_middleware])
     app["client"] = client
@@ -366,11 +478,14 @@ def create_http_app(
     app["split_chunks"] = split_chunks
     app["inbox_dir"] = inbox_dir
     app["reset_session"] = reset_session
+    app["run_prompt_cron"] = run_prompt_cron
     app.router.add_get("/healthz", _healthz)
     app.router.add_post("/reply", _reply)
     app.router.add_post("/react", _react)
     app.router.add_post("/edit_message", _edit_message)
     app.router.add_post("/fetch_messages", _fetch_messages)
+    app.router.add_post("/preflight_channel", _preflight_channel)
+    app.router.add_post("/run_prompt_cron", _run_prompt_cron)
     app.router.add_post("/download_attachment", _download_attachment)
     app.router.add_post("/reset_session", _reset_session)
     return app
@@ -386,6 +501,7 @@ async def serve_http_api(
     host: str,
     port: int,
     logger: Any,
+    run_prompt_cron: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ) -> None:
     try:
         app = create_http_app(
@@ -395,6 +511,7 @@ async def serve_http_api(
             split_chunks=split_chunks,
             inbox_dir=inbox_dir,
             reset_session=reset_session,
+            run_prompt_cron=run_prompt_cron,
         )
         runner = web.AppRunner(app)
         await runner.setup()

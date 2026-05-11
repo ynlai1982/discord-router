@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +22,8 @@ SESSIONS_PATH = Path(__file__).parent / "sessions.json"
 MCP_CONFIG_PATH = Path(__file__).parent / "mcp" / "discord-mcp.json"
 MCP_SERVER_PATH = Path(__file__).parent / "mcp" / "server.ts"
 CHUNK_SIZE = 2000
+COMMAND_CRON_OUTPUT_BUFFER_BYTES = 65536
+COMMAND_CRON_TERMINATE_GRACE_SECONDS = 2.0
 HTTP_HOST = "127.0.0.1"
 HTTP_PORT = 9876
 INBOX_DIR = str(Path(__file__).parent / "inbox")
@@ -30,6 +33,7 @@ INBOX_DIR = str(Path(__file__).parent / "inbox")
 IDLE_WATCHDOG_DEFAULT_ENABLED = True
 IDLE_WATCHDOG_DEFAULT_THRESHOLD = 180
 IDLE_WATCHDOG_DEFAULT_POLL = 5.0
+RESULT_EOF_GRACE_SECONDS = 5.0
 CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 
 # ---------------------------
@@ -79,6 +83,96 @@ def split_chunks(text: str, limit: int = CHUNK_SIZE) -> List[str]:
         chunks.append(text[:cut])
         text = text[cut:].lstrip("\n")
     return chunks
+
+
+async def _run_diag_command(args: List[str], timeout: float = 1.0) -> Tuple[int, str, str]:
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+    except asyncio.TimeoutError:
+        if proc is not None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        return 124, "", "diagnostic command timed out"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+async def _collect_eof_grace_context(pid: Optional[int]) -> Dict[str, Any]:
+    context: Dict[str, Any] = {
+        "process_tree": [],
+        "child_pids": [],
+        "open_files": [],
+        "diag_errors": [],
+    }
+    if not pid:
+        return context
+
+    rc, ps_out, ps_err = await _run_diag_command(
+        ["/bin/ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,command="],
+        timeout=1.0,
+    )
+    if rc != 0:
+        context["diag_errors"].append(f"ps rc={rc}: {ps_err.strip()[:200]}")
+        return context
+
+    rows = []
+    by_ppid: Dict[int, List[Dict[str, Any]]] = {}
+    for line in ps_out.splitlines():
+        parts = line.strip().split(None, 5)
+        if len(parts) < 6:
+            continue
+        try:
+            row = {
+                "pid": int(parts[0]),
+                "ppid": int(parts[1]),
+                "pgid": int(parts[2]),
+                "stat": parts[3],
+                "etime": parts[4],
+                "command": parts[5][:240],
+            }
+        except ValueError:
+            continue
+        rows.append(row)
+        by_ppid.setdefault(row["ppid"], []).append(row)
+
+    wanted = {pid}
+    queue = [pid]
+    while queue:
+        current = queue.pop(0)
+        for child in by_ppid.get(current, []):
+            child_pid = child["pid"]
+            if child_pid in wanted:
+                continue
+            wanted.add(child_pid)
+            queue.append(child_pid)
+
+    tree = [row for row in rows if row["pid"] in wanted]
+    tree.sort(key=lambda row: (row["ppid"] != pid and row["pid"] != pid, row["ppid"], row["pid"]))
+    context["process_tree"] = tree[:40]
+    context["child_pids"] = sorted(p for p in wanted if p != pid)[:80]
+
+    pids_for_lsof = ",".join(str(row["pid"]) for row in tree[:20])
+    if pids_for_lsof:
+        rc, lsof_out, lsof_err = await _run_diag_command(
+            ["/usr/sbin/lsof", "-nP", "-p", pids_for_lsof],
+            timeout=1.0,
+        )
+        if rc == 0:
+            context["open_files"] = lsof_out.splitlines()[:60]
+        elif rc not in (1,):
+            context["diag_errors"].append(f"lsof rc={rc}: {lsof_err.strip()[:200]}")
+
+    return context
 
 
 def to_int_set(values: List[Any]) -> set:
@@ -219,7 +313,7 @@ def build_prompt(user_text: str, cfg: Dict[str, Any], channel_id: str = "") -> s
         # 白名單：只接受 skill_xxx.md 形式，避免 config 被改成 ../ 或含反引號/換行
         # 做 prompt injection 時被濫用。
         if re.fullmatch(r"[A-Za-z0-9_-]+\.md", warmup_skill):
-            skill_path = f"~/.claude/projects/-Users-mac-mini/memory/skills/{warmup_skill}"
+            skill_path = f"~/.agent/projects/-Users-mac-mini/memory/skills/{warmup_skill}"
             warmup_line = f"[系統] 執行任務前先讀 skill 文件 `{skill_path}`，按流程處理。跳過會出錯。\n\n"
         else:
             logger.warning("Invalid warmup_skill (skipped): %r", warmup_skill)
@@ -447,7 +541,7 @@ async def run_claude(
     if stream_mode:
         return await _run_claude_stream_inner(
             args, env, workdir, session_id, timeout_seconds, t_start,
-            progress_callback, idle_threshold_seconds,
+            progress_callback, idle_threshold_seconds, channel_name,
         )
     return await _run_claude_inner(
         args, env, workdir, session_id, timeout_seconds, t_start,
@@ -464,6 +558,7 @@ async def _run_claude_stream_inner(
     t_start: float,
     progress_callback: Optional[Any] = None,
     idle_threshold_seconds: Optional[int] = None,
+    channel_name: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str]]:
     """Streaming variant: read stdout line-by-line, parse stream-json events,
     log them as they arrive. Progress callback fired as fire-and-forget task
@@ -485,6 +580,18 @@ async def _run_claude_stream_inner(
     text_chunks: List[str] = []
     event_counts = {"system": 0, "assistant_text": 0, "tool_use": 0, "tool_result": 0,
                     "thinking": 0, "rate_limit_event": 0, "result": 0, "other": 0}
+    run_id = uuid.uuid4().hex[:12]
+    result_seen = {"value": False}
+    killed_after_result = {"value": False}
+    stdout_eof_seen = {"value": False}
+    result_at = {"value": None}
+    eof_at = {"value": None}
+    grace_expired_at = {"value": None}
+    stdout_lines_after_result = {"value": 0}
+    non_json_after_result = {"value": 0}
+    result_subtype = {"value": None}
+    claude_duration_ms = {"value": None}
+    eof_grace_context = {"value": {}}
 
     async def _drain_stderr() -> bytes:
         if proc.stderr is None:
@@ -508,7 +615,22 @@ async def _run_claude_stream_inner(
         if proc.stdout is None:
             return
         while True:
-            if idle_enabled:
+            if result_seen["value"]:
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(),
+                        timeout=RESULT_EOF_GRACE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    killed_after_result["value"] = True
+                    grace_expired_at["value"] = time.time()
+                    eof_grace_context["value"] = await _collect_eof_grace_context(getattr(proc, "pid", None))
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    return
+            elif idle_enabled:
                 try:
                     line = await asyncio.wait_for(proc.stdout.readline(), timeout=idle_thresh)
                 except asyncio.TimeoutError:
@@ -525,13 +647,20 @@ async def _run_claude_stream_inner(
             else:
                 line = await proc.stdout.readline()
             if not line:
+                if result_seen["value"]:
+                    stdout_eof_seen["value"] = True
+                    eof_at["value"] = time.time()
                 return
+            if result_seen["value"]:
+                stdout_lines_after_result["value"] += 1
             line_str = line.decode("utf-8", errors="replace").strip()
             if not line_str:
                 continue
             try:
                 evt = json.loads(line_str)
             except json.JSONDecodeError:
+                if result_seen["value"]:
+                    non_json_after_result["value"] += 1
                 logger.warning("[stream] non-json line: %s", line_str[:200])
                 continue
             etype = evt.get("type", "?")
@@ -594,6 +723,10 @@ async def _run_claude_stream_inner(
                         logger.info("[stream/tool_result] %s", str(out)[:200].replace("\n", " "))
             elif etype == "result":
                 event_counts["result"] += 1
+                result_seen["value"] = True
+                result_at["value"] = time.time()
+                result_subtype["value"] = evt.get("subtype")
+                claude_duration_ms["value"] = evt.get("duration_ms")
                 final_result = evt.get("result", "") or ""
                 rsid = evt.get("session_id")
                 if rsid:
@@ -628,10 +761,45 @@ async def _run_claude_stream_inner(
         return "", final_session_id, f"Claude idle timeout after {idle_thresh:.0f}s"
 
     stderr_b = await stderr_task
+    stderr_text_for_diag = (stderr_b or b"").decode("utf-8", errors="replace")
+
+    def _ms_since_result(ts: Optional[float]) -> Optional[int]:
+        if result_at["value"] is None or ts is None:
+            return None
+        return int((ts - result_at["value"]) * 1000)
+
+    diag = {
+        "run_id": run_id,
+        "channel_name": channel_name,
+        "session_id": final_session_id,
+        "pid": getattr(proc, "pid", None),
+        "resume": bool(session_id),
+        "completed_from": "result_event" if result_seen["value"] else "stdout_eof",
+        "stdout_eof_seen": stdout_eof_seen["value"],
+        "killed_after_result": killed_after_result["value"],
+        "returncode": proc.returncode,
+        "result_to_eof_ms": _ms_since_result(eof_at["value"]),
+        "result_to_kill_ms": _ms_since_result(grace_expired_at["value"]),
+        "stdout_lines_after_result": stdout_lines_after_result["value"],
+        "non_json_after_result": non_json_after_result["value"],
+        "result_subtype": result_subtype["value"],
+        "is_error": is_error,
+        "api_error_status": api_error_status,
+        "claude_duration_ms": claude_duration_ms["value"],
+        "result_chars": len(str(final_result or "")),
+        "event_counts": event_counts,
+        "stderr_tail": stderr_text_for_diag[-2048:],
+    }
+    if killed_after_result["value"]:
+        diag.update(eof_grace_context["value"])
+        logger.warning("[stream/eof_grace_expired] %s", json.dumps(diag, ensure_ascii=False, sort_keys=True))
+    elif result_seen["value"]:
+        logger.info("[stream/finalize] %s", json.dumps(diag, ensure_ascii=False, sort_keys=True))
+
     elapsed = time.time() - t_start
     logger.info("[stream] completed in %.1fs; events=%s", elapsed, event_counts)
 
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not killed_after_result["value"]:
         stderr_text = (stderr_b or b"").decode("utf-8", errors="replace").strip()
         err = stderr_text or final_result or f"claude exited with code {proc.returncode}"
         logger.error("[stream] claude error (exit %d): %s", proc.returncode, err[:500])
@@ -911,6 +1079,186 @@ async def _run_direct_message_cron(client: "RouterClient", job: Dict[str, Any]) 
         logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
 
 
+class _BoundedBytesBuffer:
+    def __init__(self, limit: int):
+        self.limit = max(0, int(limit))
+        self.parts: List[bytes] = []
+        self.size = 0
+        self.truncated = False
+
+    def append(self, data: bytes) -> None:
+        if not data:
+            return
+        remaining = self.limit - self.size
+        if remaining <= 0:
+            self.truncated = True
+            return
+        if len(data) > remaining:
+            self.parts.append(data[:remaining])
+            self.size += remaining
+            self.truncated = True
+            return
+        self.parts.append(data)
+        self.size += len(data)
+
+    def text(self) -> str:
+        out = b"".join(self.parts).decode("utf-8", errors="replace")
+        if self.truncated:
+            out += "\n...[truncated]"
+        return out.strip()
+
+
+def _format_seconds(seconds: float) -> str:
+    return f"{seconds:g}"
+
+
+async def _read_command_stream(
+    stream: Optional[asyncio.StreamReader],
+    stream_name: str,
+    events: "asyncio.Queue[Tuple[str, str, Optional[bytes]]]",
+) -> None:
+    if stream is None:
+        await events.put(("eof", stream_name, None))
+        return
+    try:
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            await events.put(("line", stream_name, line))
+    except Exception as e:
+        await events.put(("error", stream_name, str(e).encode("utf-8", errors="replace")))
+    finally:
+        await events.put(("eof", stream_name, None))
+
+
+async def _wait_command_process(
+    proc: asyncio.subprocess.Process,
+    events: "asyncio.Queue[Tuple[str, str, Optional[bytes]]]",
+) -> None:
+    await proc.wait()
+    await events.put(("exit", "process", None))
+
+
+async def _terminate_command_process(proc: asyncio.subprocess.Process) -> None:
+    pid = getattr(proc, "pid", None)
+    if getattr(proc, "returncode", None) is not None:
+        return
+
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            try:
+                proc.terminate()
+            except AttributeError:
+                proc.kill()
+            except ProcessLookupError:
+                return
+        except Exception:
+            try:
+                proc.terminate()
+            except AttributeError:
+                proc.kill()
+            except ProcessLookupError:
+                return
+    else:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=COMMAND_CRON_TERMINATE_GRACE_SECONDS)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
+        except Exception:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
+    else:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    await proc.wait()
+
+
+async def _collect_command_cron_output(
+    proc: asyncio.subprocess.Process,
+    timeout_seconds: float,
+    idle_threshold_seconds: Optional[float],
+    buffer_limit: int,
+) -> Tuple[str, str, bool]:
+    stdout_buf = _BoundedBytesBuffer(buffer_limit)
+    stderr_buf = _BoundedBytesBuffer(buffer_limit)
+    events: "asyncio.Queue[Tuple[str, str, Optional[bytes]]]" = asyncio.Queue()
+    tasks = [
+        asyncio.create_task(_read_command_stream(proc.stdout, "stdout", events)),
+        asyncio.create_task(_read_command_stream(proc.stderr, "stderr", events)),
+        asyncio.create_task(_wait_command_process(proc, events)),
+    ]
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    last_activity_at = started_at
+    stdout_eof = False
+    stderr_eof = False
+    process_exited = False
+
+    try:
+        while not (stdout_eof and stderr_eof and process_exited):
+            if idle_threshold_seconds is None:
+                remaining = started_at + timeout_seconds - loop.time()
+                if remaining <= 0:
+                    return stdout_buf.text(), stderr_buf.text(), True
+                wait_timeout = remaining
+            else:
+                remaining_idle = last_activity_at + idle_threshold_seconds - loop.time()
+                if remaining_idle <= 0:
+                    return stdout_buf.text(), stderr_buf.text(), True
+                wait_timeout = remaining_idle
+
+            try:
+                event_type, stream_name, payload = await asyncio.wait_for(events.get(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                return stdout_buf.text(), stderr_buf.text(), True
+
+            if event_type == "line":
+                if stream_name == "stdout":
+                    stdout_buf.append(payload or b"")
+                else:
+                    stderr_buf.append(payload or b"")
+                last_activity_at = loop.time()
+            elif event_type == "eof":
+                if stream_name == "stdout":
+                    stdout_eof = True
+                elif stream_name == "stderr":
+                    stderr_eof = True
+            elif event_type == "exit":
+                process_exited = True
+            elif event_type == "error":
+                stderr_buf.append(payload or b"")
+                last_activity_at = loop.time()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    return stdout_buf.text(), stderr_buf.text(), False
+
+
 async def _run_command_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
     name = job.get("name", "unnamed")
     channel_id = str(job.get("channel_id", ""))
@@ -926,26 +1274,49 @@ async def _run_command_cron(client: "RouterClient", job: Dict[str, Any]) -> None
         logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
         return
 
-    cmd_timeout = int(job.get("timeout_seconds", 120))
+    cmd_timeout = float(job.get("timeout_seconds", 120))
+    idle_threshold = job.get("idle_threshold_seconds")
+    idle_threshold_seconds = float(idle_threshold) if idle_threshold is not None else None
+    buffer_limit = int(job.get("output_buffer_bytes", COMMAND_CRON_OUTPUT_BUFFER_BYTES))
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        preexec_fn=os.setsid,
     )
+    stdout = ""
+    stderr = ""
+    timed_out = False
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=cmd_timeout)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
-        logger.warning("Cron job %s: command timed out after %ds", name, cmd_timeout)
-        await discord_channel.send(f"⚠️ `{name}` 指令逾時（{cmd_timeout}s）")
+        stdout, stderr, timed_out = await _collect_command_cron_output(
+            proc,
+            timeout_seconds=cmd_timeout,
+            idle_threshold_seconds=idle_threshold_seconds,
+            buffer_limit=buffer_limit,
+        )
+    finally:
+        if timed_out:
+            await _terminate_command_process(proc)
+
+    if timed_out:
+        if idle_threshold_seconds is not None:
+            logger.warning(
+                "Cron job %s: command idle timed out after %ss",
+                name,
+                _format_seconds(idle_threshold_seconds),
+            )
+            await discord_channel.send(
+                f"⚠️ `{name}` 指令閒置逾時（{_format_seconds(idle_threshold_seconds)}s）"
+            )
+            if stderr:
+                logger.info("Cron job %s: stderr before idle timeout: %s", name, stderr[:500])
+        else:
+            logger.warning("Cron job %s: command timed out after %ss", name, _format_seconds(cmd_timeout))
+            await discord_channel.send(f"⚠️ `{name}` 指令逾時（{_format_seconds(cmd_timeout)}s）")
         return
 
-    stdout = (stdout_b or b"").decode("utf-8", errors="replace").strip()
-    stderr = (stderr_b or b"").decode("utf-8", errors="replace").strip()
+    if proc.returncode == 0 and stderr:
+        logger.info("Cron job %s: command stderr (exit 0): %s", name, stderr[:500])
     success_msg = job.get("success_message")
     if proc.returncode == 0:
         if job.get("silent_success") and not success_msg and not stdout:
@@ -961,7 +1332,7 @@ async def _run_command_cron(client: "RouterClient", job: Dict[str, Any]) -> None
         logger.warning("Cron job %s: command failed (exit %d)", name, proc.returncode)
 
 
-async def _run_prompt_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
+async def _run_prompt_cron(client: "RouterClient", job: Dict[str, Any]) -> Dict[str, Any]:
     name = job.get("name", "unnamed")
     channel_id = str(job.get("channel_id", ""))
     prompt_text = job.get("prompt", "")
@@ -970,17 +1341,17 @@ async def _run_prompt_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
         numeric_channel_id = int(channel_id)
     except ValueError:
         logger.warning("Cron job %s: invalid channel id %s", name, channel_id)
-        return
+        return {"ok": False, "status": "failed", "error": f"invalid channel id {channel_id}"}
 
     cfg = get_channel_cfg(numeric_channel_id)
     if cfg is None:
         logger.warning("Cron job %s: channel %s not in config", name, channel_id)
-        return
+        return {"ok": False, "status": "failed", "error": f"channel {channel_id} not in config"}
 
     discord_channel = client.get_channel(numeric_channel_id)
     if discord_channel is None:
         logger.warning("Cron job %s: could not find Discord channel %s", name, channel_id)
-        return
+        return {"ok": False, "status": "failed", "error": f"could not find Discord channel {channel_id}"}
 
     group = get_session_group(cfg)
     workdir = _resolve_group_workdir(group)
@@ -1029,10 +1400,24 @@ async def _run_prompt_cron(client: "RouterClient", job: Dict[str, Any]) -> None:
             output_text = f"Error: {err}"
             for chunk in split_chunks(output_text):
                 await discord_channel.send(chunk)
+            return {
+                "ok": False,
+                "status": "failed",
+                "error": err,
+                "session_group": group,
+                "session_id": new_session_id or session_id,
+            }
         elif result:
             for chunk in split_chunks(result):
                 await discord_channel.send(chunk)
         # else: empty result = Claude replied via MCP, skip
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "error": "",
+            "session_group": group,
+            "session_id": new_session_id or session_id,
+        }
 
 
 async def _run_one_cron_job(client: "RouterClient", job: Dict[str, Any], now_key: str) -> None:
@@ -1141,6 +1526,7 @@ class RouterClient(discord.Client):
                 split_chunks=split_chunks,
                 inbox_dir=INBOX_DIR,
                 reset_session=reset_session_by_channel,
+                run_prompt_cron=lambda job: _run_prompt_cron(self, job),
                 host=HTTP_HOST,
                 port=HTTP_PORT,
                 logger=logger,

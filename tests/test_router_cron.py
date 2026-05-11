@@ -88,8 +88,11 @@ class FakeProcess:
     def __init__(self, stdout=b"", stderr=b"", returncode=0):
         self._stdout = stdout
         self._stderr = stderr
+        self.stdout = FakeLineStream([(0, line) for line in stdout.splitlines(keepends=True)])
+        self.stderr = FakeLineStream([(0, line) for line in stderr.splitlines(keepends=True)])
         self.returncode = returncode
         self.killed = False
+        self.pid = 4321
 
     async def communicate(self):
         return self._stdout, self._stderr
@@ -98,6 +101,64 @@ class FakeProcess:
         self.killed = True
 
     async def wait(self):
+        return self.returncode
+
+
+class FakeLineStream:
+    def __init__(self, events):
+        self.events = list(events)
+        self.lines = []
+
+    async def readline(self):
+        if not self.events:
+            return b""
+        delay, line = self.events.pop(0)
+        await asyncio.sleep(delay)
+        self.lines.append(line)
+        return line
+
+
+class StreamingFakeProcess:
+    def __init__(self, stdout_events=None, stderr_events=None, returncode=0):
+        stdout_events = stdout_events or []
+        stderr_events = stderr_events or []
+        self.stdout = FakeLineStream(stdout_events)
+        self.stderr = FakeLineStream(stderr_events)
+        self._duration = max(
+            sum(delay for delay, _line in stdout_events),
+            sum(delay for delay, _line in stderr_events),
+        )
+        self.returncode = None
+        self._final_returncode = returncode
+        self.killed = False
+        self.pid = 4321
+
+    async def communicate(self):
+        stdout = []
+        stderr = []
+        while True:
+            line = await self.stdout.readline()
+            if not line:
+                break
+            stdout.append(line)
+        while True:
+            line = await self.stderr.readline()
+            if not line:
+                break
+            stderr.append(line)
+        self.returncode = self._final_returncode
+        return b"".join(stdout), b"".join(stderr)
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        if self.returncode is not None:
+            return self.returncode
+        await asyncio.sleep(self._duration + 0.001)
+        if self.returncode is None:
+            self.returncode = self._final_returncode
         return self.returncode
 
 
@@ -188,6 +249,183 @@ class CommandCronTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(channel.sent, ["⚠️ `cmd` 失敗 (exit 2): bad"])
 
+    async def test_run_command_cron_stderr_heartbeat_prevents_idle_timeout(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+        proc = StreamingFakeProcess(
+            stdout_events=[(0.01, b"done\n")],
+            stderr_events=[(0.01, b"beat\n"), (0.04, b"beat\n"), (0.04, b"beat\n")],
+            returncode=0,
+        )
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return proc
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "cmd",
+                    "channel_id": "123",
+                    "command": "heartbeat",
+                    "timeout_seconds": 0.05,
+                    "idle_threshold_seconds": 0.08,
+                },
+            )
+
+        self.assertFalse(proc.killed)
+        self.assertEqual(channel.sent, ["done"])
+
+    async def test_run_command_cron_idle_without_output_is_killed(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+        proc = StreamingFakeProcess(stdout_events=[(10, b"too late\n")], returncode=0)
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return proc
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "cmd",
+                    "channel_id": "123",
+                    "command": "quiet",
+                    "timeout_seconds": 10,
+                    "idle_threshold_seconds": 0.05,
+                },
+            )
+
+        self.assertTrue(proc.killed)
+        self.assertEqual(channel.sent, ["⚠️ `cmd` 指令閒置逾時（0.05s）"])
+
+    async def test_run_command_cron_stdout_summary_ignores_stderr_heartbeat(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+        proc = StreamingFakeProcess(
+            stdout_events=[(0.01, b"summary\n")],
+            stderr_events=[(0.01, b"heartbeat should stay out\n")],
+            returncode=0,
+        )
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return proc
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "cmd",
+                    "channel_id": "123",
+                    "command": "heartbeat",
+                    "timeout_seconds": 10,
+                    "idle_threshold_seconds": 0.05,
+                },
+            )
+
+        self.assertEqual(channel.sent, ["summary"])
+
+    async def test_run_command_cron_without_idle_uses_wall_clock_timeout(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+        proc = StreamingFakeProcess(
+            stderr_events=[(0.01, b"beat\n"), (0.04, b"beat\n"), (0.04, b"beat\n")],
+            returncode=0,
+        )
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return proc
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "cmd",
+                    "channel_id": "123",
+                    "command": "heartbeat",
+                    "timeout_seconds": 0.05,
+                },
+            )
+
+        self.assertTrue(proc.killed)
+        self.assertEqual(channel.sent, ["⚠️ `cmd` 指令逾時（0.05s）"])
+
+    async def test_run_command_cron_timeout_terminates_process_group(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+        proc = StreamingFakeProcess(stdout_events=[(10, b"too late\n")], returncode=0)
+        create_kwargs = {}
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            create_kwargs.update(kwargs)
+            return proc
+
+        def fake_killpg(_pid, sig):
+            if sig == router.signal.SIGKILL:
+                proc.returncode = -9
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ), mock.patch.object(router.os, "killpg", side_effect=fake_killpg) as killpg:
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "cmd",
+                    "channel_id": "123",
+                    "command": "quiet",
+                    "timeout_seconds": 10,
+                    "idle_threshold_seconds": 0.05,
+                },
+            )
+
+        self.assertIs(create_kwargs.get("preexec_fn"), router.os.setsid)
+        killpg.assert_any_call(proc.pid, router.signal.SIGTERM)
+        killpg.assert_any_call(proc.pid, router.signal.SIGKILL)
+        self.assertEqual(channel.sent, ["⚠️ `cmd` 指令閒置逾時（0.05s）"])
+
+    async def test_run_command_cron_stdout_buffer_is_bounded(self):
+        channel = FakeChannel()
+        client = FakeClient(channel)
+        proc = StreamingFakeProcess(stdout_events=[(0.01, b"1234567890\n")], returncode=0)
+
+        async def fake_create_subprocess_shell(*args, **kwargs):
+            return proc
+
+        with mock.patch.object(
+            router.asyncio,
+            "create_subprocess_shell",
+            side_effect=fake_create_subprocess_shell,
+        ):
+            await router._run_command_cron(
+                client,
+                {
+                    "name": "cmd",
+                    "channel_id": "123",
+                    "command": "long-output",
+                    "output_buffer_bytes": 8,
+                },
+            )
+
+        self.assertEqual(channel.sent, ["12345678\n...[truncated]"])
+
 
 class PromptCronTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_prompt_cron_uses_group_lock_and_touches_session(self):
@@ -198,7 +436,7 @@ class PromptCronTests(unittest.IsolatedAsyncioTestCase):
             "name": "main",
             "session_group": "main",
             "timeout_seconds": 300,
-            "workdir": "/Users/mac_mini",
+            "workdir": "/Users/example",
         }
 
         async def fake_get_session(group):
@@ -213,12 +451,12 @@ class PromptCronTests(unittest.IsolatedAsyncioTestCase):
             return "ok", "new-session", None
 
         with mock.patch.object(router, "get_channel_cfg", return_value=cfg), \
-             mock.patch.object(router, "_resolve_group_workdir", return_value="/Users/mac_mini"), \
+             mock.patch.object(router, "_resolve_group_workdir", return_value="/Users/example"), \
              mock.patch.object(router, "get_group_lock", return_value=FakeLock(events)), \
              mock.patch.object(router, "get_session", side_effect=fake_get_session), \
              mock.patch.object(router, "touch_session", side_effect=fake_touch_session), \
              mock.patch.object(router, "run_claude", side_effect=fake_run_claude):
-            await router._run_prompt_cron(
+            result = await router._run_prompt_cron(
                 client,
                 {"name": "prompt", "channel_id": "123", "prompt": "do work"},
             )
@@ -234,6 +472,9 @@ class PromptCronTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(channel.sent, ["ok"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["session_group"], "main")
+        self.assertEqual(result["session_id"], "new-session")
 
 
 class CronTaskWrapperTests(unittest.IsolatedAsyncioTestCase):
@@ -324,6 +565,71 @@ class CronSchedulerDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         await asyncio.gather(*created_tasks)
         self.assertEqual([name for name, _ in dispatched], ["one", "two"])
+
+
+class FakeStream:
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    async def readline(self):
+        if self.lines:
+            return self.lines.pop(0)
+        await asyncio.sleep(10)
+        return b""
+
+    async def read(self):
+        return b""
+
+
+class FakeStreamProcess:
+    def __init__(self, lines, returncode=-9):
+        self.stdout = FakeStream(lines)
+        self.stderr = FakeStream([])
+        self.returncode = returncode
+        self.pid = 12345
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+    async def wait(self):
+        return self.returncode
+
+
+class ClaudeStreamResultGraceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_result_returns_after_grace_when_stdout_never_eofs(self):
+        lines = [
+            b'{"type":"system","subtype":"init","session_id":"session-1"}\n',
+            b'{"type":"result","subtype":"success","result":"done","session_id":"session-1"}\n',
+        ]
+        proc = FakeStreamProcess(lines)
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return proc
+
+        with mock.patch.object(router.asyncio, "create_subprocess_exec", side_effect=fake_create_subprocess_exec), \
+             mock.patch.object(router, "RESULT_EOF_GRACE_SECONDS", 0.001, create=True), \
+             self.assertLogs("discord-router", level="WARNING") as logs:
+            result, session_id, err = await router._run_claude_stream_inner(
+                ["claude"],
+                {},
+                "/Users/example",
+                None,
+                30,
+                router.time.time(),
+                channel_name="codex-main",
+            )
+
+        self.assertEqual(result, "done")
+        self.assertEqual(session_id, "session-1")
+        self.assertIsNone(err)
+        self.assertTrue(proc.killed)
+        joined = "\n".join(logs.output)
+        self.assertIn('"channel_name": "codex-main"', joined)
+        self.assertIn('"completed_from": "result_event"', joined)
+        self.assertIn('"stdout_eof_seen": false', joined)
+        self.assertIn('"pid": 12345', joined)
+        self.assertIn('"process_tree"', joined)
 
 
 if __name__ == "__main__":
